@@ -1,0 +1,45 @@
+fastapi==0.115.5
+uvicorn[standard]==0.32.1
+python-multipart==0.0.17
+python-dotenv==1.0.1
+sqlalchemy==2.0.36
+alembic==1.14.0
+pydantic==2.10.3
+pydantic-settings==2.6.1
+
+# LLM providers
+openai==1.57.2
+anthropic==0.40.0
+google-generativeai>=0.8.3
+
+# Data analysis
+pandas==2.2.3
+numpy==2.2.0
+scipy==1.14.1
+
+# File parsing
+beautifulsoup4==4.12.3
+lxml==5.3.0
+openpyxl==3.1.5
+python-docx==1.1.2
+Pillow==11.0.0
+
+# HTTP client
+httpx==0.28.1
+aiofiles==24.1.0
+
+# Background tasks
+apscheduler==3.10.4
+
+# Testing
+pytest==8.3.4
+pytest-asyncio==0.24.0
+httpx==0.28.1
+
+# Utilities
+python-jose[cryptography]==3.3.0
+passlib[bcrypt]==1.7.4
+tenacity==9.0.0
+
+# MT5 (Windows only — comment out on Linux/Mac)
+# MetaTrader5==5.0.4818

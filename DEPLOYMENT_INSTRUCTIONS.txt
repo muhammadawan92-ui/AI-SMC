@@ -1,0 +1,122 @@
+EA AI Platform - GitHub + Server Deployment Instructions
+=========================================================
+
+This guide covers:
+1) Push this project to GitHub
+2) Clone and run it on a Linux server
+3) Auto-start backend/frontend/Ollama on reboot with restart loops
+
+
+PART A - PUSH PROJECT TO GITHUB
+-------------------------------
+
+Run these commands on your local machine from project root:
+
+1. Initialize git if needed:
+   git init
+
+2. Create main branch:
+   git checkout -b main
+
+3. Stage and commit:
+   git add .
+   git commit -m "Initial EA AI Platform deployment setup"
+
+4. Create an empty GitHub repository (via website), then connect it:
+   git remote add origin https://github.com/<YOUR_USERNAME>/<YOUR_REPO>.git
+
+5. Push:
+   git push -u origin main
+
+IMPORTANT:
+- Do not commit backend/.env (already ignored by .gitignore).
+- If a key was ever exposed, rotate it before production.
+
+
+PART B - PREPARE YOUR SERVER (UBUNTU/DEBIAN)
+--------------------------------------------
+
+SSH into your server:
+   ssh <user>@<server-ip>
+
+Then run:
+   sudo apt-get update
+   sudo apt-get install -y git
+
+
+PART C - CLONE + FULL SETUP + AUTOSTART
+---------------------------------------
+
+1) Clone your repository:
+   cd /opt
+   sudo git clone https://github.com/<YOUR_USERNAME>/<YOUR_REPO>.git ea-ai-platform
+   sudo chown -R $USER:$USER /opt/ea-ai-platform
+   cd /opt/ea-ai-platform
+
+2) Make scripts executable:
+   chmod +x scripts/server/setup_server.sh
+   chmod +x scripts/server/update_and_restart.sh
+
+3) Run bootstrap script (installs deps, ollama, services, starts app):
+   sudo bash scripts/server/setup_server.sh https://github.com/<YOUR_USERNAME>/<YOUR_REPO>.git main
+
+4) Edit backend environment:
+   nano /opt/ea-ai-platform/backend/.env
+
+Required minimum for Ollama local inference:
+   LLM_PROVIDER=ollama
+   LOCAL_LLM_BASE_URL=http://127.0.0.1:11434/v1
+   LOCAL_LLM_API_KEY=ollama
+   LOCAL_LLM_MODEL=llama3.1:8b
+   LOCAL_LLM_VISION_MODEL=llava
+   MOCK_MODE=false
+   MOCK_LLM=false
+
+5) Pull Ollama models:
+   ollama pull llama3.1:8b
+   ollama pull llava
+
+6) Restart services after env/model changes:
+   sudo systemctl restart ea-ollama ea-backend ea-frontend
+
+
+PART D - CHECK EVERYTHING IS RUNNING
+------------------------------------
+
+Service status:
+   sudo systemctl status ea-ollama ea-backend ea-frontend --no-pager
+
+Backend logs:
+   sudo journalctl -u ea-backend -n 100 --no-pager
+
+Frontend logs:
+   sudo journalctl -u ea-frontend -n 100 --no-pager
+
+API test:
+   curl http://127.0.0.1:8000/docs
+
+Frontend test:
+   curl -I http://127.0.0.1:3000
+
+
+PART E - AUTO-RUN + LOOP BEHAVIOR
+---------------------------------
+
+Auto-start on reboot:
+- Enabled by setup script using systemd enable.
+
+Auto-restart loops:
+- All services have:
+  Restart=always
+  RestartSec=5
+- If backend/frontend crash, systemd restarts them automatically.
+
+
+PART F - DEPLOY UPDATES AFTER NEW GITHUB PUSH
+---------------------------------------------
+
+On server:
+   cd /opt/ea-ai-platform
+   sudo bash scripts/server/update_and_restart.sh main
+
+This pulls latest code, refreshes dependencies, rebuilds frontend, and restarts services.

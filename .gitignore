@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.venv/
+venv/
+
+# Node / Next
+node_modules/
+frontend/.next/
+frontend/out/
+
+# Env / secrets
+.env
+.env.*
+backend/.env
+frontend/.env
+frontend/.env.local
+
+# Runtime data / artifacts
+storage/uploads/*
+storage/reports/*
+storage/strategy_versions/*
+backend/storage/uploads/*
+backend/storage/reports/*
+backend/storage/strategy_versions/*
+backend/storage/*.db
+backend/storage/*.db-shm
+backend/storage/*.db-wal
+!storage/uploads/.gitkeep
+!storage/reports/.gitkeep
+!storage/strategy_versions/.gitkeep
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

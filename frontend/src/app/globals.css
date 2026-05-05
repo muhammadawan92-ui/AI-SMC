@@ -1,0 +1,61 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap');
+
+@layer base {
+  * { @apply border-gray-700; }
+  body {
+    @apply bg-gray-950 text-gray-100 font-sans antialiased;
+  }
+  ::-webkit-scrollbar { width: 6px; height: 6px; }
+  ::-webkit-scrollbar-track { @apply bg-gray-900; }
+  ::-webkit-scrollbar-thumb { @apply bg-gray-700 rounded; }
+  ::-webkit-scrollbar-thumb:hover { @apply bg-gray-600; }
+}
+
+@layer components {
+  .card {
+    @apply bg-gray-900 border border-gray-800 rounded-xl p-6;
+  }
+  .card-sm {
+    @apply bg-gray-900 border border-gray-800 rounded-lg p-4;
+  }
+  .btn-primary {
+    @apply bg-brand-600 hover:bg-brand-700 text-white font-medium px-4 py-2 rounded-lg transition-colors disabled:opacity-50 disabled:cursor-not-allowed;
+  }
+  .btn-secondary {
+    @apply bg-gray-800 hover:bg-gray-700 text-gray-200 font-medium px-4 py-2 rounded-lg transition-colors border border-gray-700;
+  }
+  .btn-danger {
+    @apply bg-red-900/30 hover:bg-red-900/50 text-red-400 font-medium px-4 py-2 rounded-lg transition-colors border border-red-900/50;
+  }
+  .btn-success {
+    @apply bg-green-900/30 hover:bg-green-900/50 text-green-400 font-medium px-4 py-2 rounded-lg transition-colors border border-green-900/50;
+  }
+  .badge {
+    @apply inline-flex items-center px-2 py-0.5 rounded text-xs font-medium;
+  }
+  .input {
+    @apply bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-gray-100 w-full focus:outline-none focus:border-brand-500 focus:ring-1 focus:ring-brand-500;
+  }
+  .select {
+    @apply bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-gray-100 w-full focus:outline-none focus:border-brand-500;
+  }
+  .label {
+    @apply text-sm text-gray-400 font-medium mb-1 block;
+  }
+  .metric-value {
+    @apply text-2xl font-bold text-white;
+  }
+  .metric-label {
+    @apply text-xs text-gray-500 uppercase tracking-wider font-medium;
+  }
+  .section-title {
+    @apply text-lg font-semibold text-white mb-4;
+  }
+  .code-block {
+    @apply bg-gray-950 border border-gray-800 rounded-lg p-4 font-mono text-sm text-gray-300 overflow-auto;
+  }
+}
