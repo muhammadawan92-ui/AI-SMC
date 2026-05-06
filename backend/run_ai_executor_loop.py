@@ -1,19 +1,3 @@
-"""
-run_ai_executor_loop.py
-
-Continuously checks for valid AI SMC trade setups by running demo_trade_executor.py
-at a fixed interval.
-
-Place this file in:
-C:\Users\osama\cursor project\ea-ai-platform\backend
-
-Example:
-python run_ai_executor_loop.py --interval 300
-
-300 seconds = every 5 minutes
-900 seconds = every 15 minutes
-"""
-
 import argparse
 import subprocess
 import sys
@@ -35,38 +19,45 @@ def timestamp():
 
 def write_log(message: str):
     line = f"[{timestamp()}] {message}"
-    print(line)
+    print(line, flush=True)
 
     with LOG_FILE.open("a", encoding="utf-8") as f:
         f.write(line + "\n")
 
 
 def run_executor_once():
-    cmd = [sys.executable, "demo_trade_executor.py"]
+    cmd = [sys.executable, "-u", "demo_trade_executor.py"]
 
     write_log("Running demo_trade_executor.py...")
 
     try:
-        result = subprocess.run(
+        process = subprocess.Popen(
             cmd,
             cwd=str(BACKEND_DIR),
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
             text=True,
-            timeout=180,
+            bufsize=1,
         )
 
-        if result.stdout:
-            for line in result.stdout.strip().splitlines():
-                write_log(line)
+        start_time = time.time()
+        timeout_seconds = 180
 
-        if result.stderr:
-            for line in result.stderr.strip().splitlines():
-                write_log("ERROR: " + line)
+        while True:
+            line = process.stdout.readline()
 
-        write_log(f"Executor finished with return code: {result.returncode}")
+            if line:
+                write_log(line.rstrip())
 
-    except subprocess.TimeoutExpired:
-        write_log("ERROR: demo_trade_executor.py timed out after 180 seconds.")
+            if process.poll() is not None:
+                break
+
+            if time.time() - start_time > timeout_seconds:
+                process.kill()
+                write_log("ERROR: demo_trade_executor.py timed out after 180 seconds.")
+                return
+
+        write_log(f"Executor finished with return code: {process.returncode}")
 
     except Exception as exc:
         write_log(f"ERROR: executor loop failed: {exc}")
@@ -78,14 +69,16 @@ def main():
         "--interval",
         type=int,
         default=300,
-        help="Seconds between setup checks. 300 = 5 minutes, 900 = 15 minutes.",
+        help="Seconds between setup checks. 300 = 5 minutes.",
     )
     args = parser.parse_args()
 
     interval = max(60, int(args.interval))
 
     write_log("AI executor loop started.")
+    write_log(f"Backend folder: {BACKEND_DIR}")
     write_log(f"Check interval: {interval} seconds.")
+    write_log(f"Log file: {LOG_FILE}")
     write_log("Press CTRL+C to stop.")
 
     while True:

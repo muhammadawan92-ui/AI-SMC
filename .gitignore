@@ -14,6 +14,7 @@ frontend/out/
 # Env / secrets
 .env
 .env.*
+!.env.example
 backend/.env
 frontend/.env
 frontend/.env.local
@@ -22,12 +23,8 @@ frontend/.env.local
 storage/uploads/*
 storage/reports/*
 storage/strategy_versions/*
-backend/storage/uploads/*
-backend/storage/reports/*
-backend/storage/strategy_versions/*
-backend/storage/*.db
-backend/storage/*.db-shm
-backend/storage/*.db-wal
+# Entire backend/storage tree (nested uploads, SQLite WAL, backtests, logs)
+backend/storage/**
 !storage/uploads/.gitkeep
 !storage/reports/.gitkeep
 !storage/strategy_versions/.gitkeep

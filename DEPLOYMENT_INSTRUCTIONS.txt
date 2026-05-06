@@ -53,6 +53,9 @@ PART C - CLONE + FULL SETUP + AUTOSTART
    sudo chown -R $USER:$USER /opt/ea-ai-platform
    cd /opt/ea-ai-platform
 
+   Create local config from the template (do not commit backend/.env):
+   cp .env.example backend/.env
+
 2) Make scripts executable:
    chmod +x scripts/server/setup_server.sh
    chmod +x scripts/server/update_and_restart.sh
@@ -60,7 +63,7 @@ PART C - CLONE + FULL SETUP + AUTOSTART
 3) Run bootstrap script (installs deps, ollama, services, starts app):
    sudo bash scripts/server/setup_server.sh https://github.com/<YOUR_USERNAME>/<YOUR_REPO>.git main
 
-4) Edit backend environment:
+4) Edit backend environment (created above from .env.example):
    nano /opt/ea-ai-platform/backend/.env
 
 Required minimum for Ollama local inference:

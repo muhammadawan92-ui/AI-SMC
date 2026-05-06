@@ -17,7 +17,11 @@ import MetaTrader5 as mt5
 from dotenv import load_dotenv
 
 from test_smc_overlay import connect_mt5, build_overlay
-from trade_journal import record_trade_attempt
+from trade_journal import (
+    get_latest_active_setup,
+    record_ob_observation,
+    record_trade_attempt,
+)
 
 
 BACKEND_DIR = Path(__file__).resolve().parent
@@ -180,6 +184,66 @@ def existing_ai_trades_count(symbol: str, magic: int):
                 count += 1
 
     return count
+
+
+def same_ob(active_row, selected_ob: dict) -> bool:
+    if not active_row or not selected_ob:
+        return False
+    tf_match = str(active_row["ob_timeframe"] or "") == str(selected_ob.get("timeframe") or "")
+    type_match = str(active_row["ob_type"] or "") == str(selected_ob.get("type") or "")
+    high_match = abs(float(active_row["ob_high"] or 0.0) - float(selected_ob.get("high") or 0.0)) < 1e-9
+    low_match = abs(float(active_row["ob_low"] or 0.0) - float(selected_ob.get("low") or 0.0)) < 1e-9
+    return tf_match and type_match and high_match and low_match
+
+
+def log_observation_if_replaced(summary: dict, active_row, symbol_info, reason: str) -> int | None:
+    selected_ob = summary.get("selected_ob") or {}
+    if not selected_ob or not active_row:
+        return None
+    original_entry = float(active_row["entry"] or 0.0)
+    if original_entry <= 0:
+        return None
+    pip_size = get_pip_size(symbol_info)
+    if pip_size <= 0:
+        pip_size = 0.0001
+    distance_pips = abs(float(selected_ob["high"]) - original_entry) / pip_size
+    obs_id = record_ob_observation(
+        original_journal_id=int(active_row["id"]),
+        symbol=str(summary.get("symbol") or symbol_info.name),
+        decision=str(summary.get("decision") or ""),
+        direction=str(summary.get("trade_direction") or ""),
+        original_ob_timeframe=str(active_row["ob_timeframe"] or ""),
+        original_ob_high=float(active_row["ob_high"] or 0.0),
+        original_ob_low=float(active_row["ob_low"] or 0.0),
+        original_entry=original_entry,
+        new_ob_timeframe=str(selected_ob.get("timeframe") or ""),
+        new_ob_type=str(selected_ob.get("type") or ""),
+        new_ob_high=float(selected_ob.get("high") or 0.0),
+        new_ob_low=float(selected_ob.get("low") or 0.0),
+        new_ob_time=selected_ob.get("time"),
+        distance_from_original_entry_pips=float(distance_pips),
+        current_price=float(summary.get("current_price") or 0.0),
+        observation_json={
+            "original_journal_id": int(active_row["id"]),
+            "symbol": str(summary.get("symbol") or symbol_info.name),
+            "decision": summary.get("decision"),
+            "direction": summary.get("trade_direction"),
+            "original_ob_timeframe": active_row["ob_timeframe"],
+            "original_ob_high": active_row["ob_high"],
+            "original_ob_low": active_row["ob_low"],
+            "original_entry": original_entry,
+            "new_ob_timeframe": selected_ob.get("timeframe"),
+            "new_ob_high": selected_ob.get("high"),
+            "new_ob_low": selected_ob.get("low"),
+            "new_ob_time": selected_ob.get("time"),
+            "distance_from_original_entry_pips": distance_pips,
+            "current_price": summary.get("current_price"),
+            "observation_reason": reason,
+        },
+        outcome_status="PENDING" if env_bool("SMC_LOG_HYPOTHETICAL_OB_OUTCOMES", True) else "NOT_TRACKED",
+        outcome_notes=reason,
+    )
+    return obs_id
 
 
 def build_trade_from_summary(summary: dict, symbol_info, tick):
@@ -397,20 +461,14 @@ def main():
     symbol = os.getenv("TRADING_SYMBOL", "GBPUSDm")
     magic = int(os.getenv("SMC_TRADE_MAGIC", "260786"))
     max_open_trades = int(os.getenv("MAX_OPEN_TRADES", "1"))
+    pending_order_lock = env_bool("SMC_PENDING_ORDER_LOCK", True)
+    allow_pending_replace = env_bool("SMC_ALLOW_PENDING_REPLACE", False)
+    log_new_ob_after_signal = env_bool("SMC_LOG_NEW_OB_AFTER_SIGNAL", True)
 
     connect_mt5()
 
     try:
         symbol_info, tick, spread_points = safety_checks(symbol)
-
-        current_count = existing_ai_trades_count(symbol, magic)
-
-        if current_count >= max_open_trades:
-            print(
-                f"Existing AI SMC trades/orders: {current_count}. "
-                f"Max allowed: {max_open_trades}. No new order."
-            )
-            return
 
         summary = build_overlay(symbol)
         trade, reason = build_trade_from_summary(summary, symbol_info, tick)
@@ -421,6 +479,40 @@ def main():
         print(f"Trade direction: {summary.get('trade_direction')}")
         print(f"Current price: {summary.get('current_price')}")
         print(f"Spread points: {spread_points:.1f}")
+
+        active_setup = get_latest_active_setup(symbol_info.name, magic)
+        current_count = existing_ai_trades_count(symbol, magic)
+
+        if pending_order_lock and active_setup and trade:
+            selected_ob = summary.get("selected_ob") or {}
+            if selected_ob and not same_ob(active_setup, selected_ob):
+                if log_new_ob_after_signal:
+                    obs_id = log_observation_if_replaced(
+                        summary,
+                        active_setup,
+                        symbol_info,
+                        reason="Pending/setup lock active; new OB observed while original setup remains active.",
+                    )
+                    if obs_id:
+                        print(f"New OB logged for learning. Existing order not moved. Observation ID: {obs_id}")
+                    else:
+                        print("New OB logged for learning. Existing order not moved.")
+                else:
+                    print("Pending/setup lock active. Existing order not moved.")
+                return
+            if not allow_pending_replace:
+                print(
+                    f"Pending/setup lock active on journal ID {active_setup['id']}. "
+                    "Existing order/setup retained; no replacement order."
+                )
+                return
+
+        if current_count >= max_open_trades:
+            print(
+                f"Existing AI SMC trades/orders: {current_count}. "
+                f"Max allowed: {max_open_trades}. No new order."
+            )
+            return
 
         if reason:
             journal_id = record_trade_attempt(

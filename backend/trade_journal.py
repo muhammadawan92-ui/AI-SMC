@@ -150,6 +150,39 @@ def init_db() -> None:
         conn.execute("CREATE INDEX IF NOT EXISTS idx_ai_trade_journal_symbol_magic ON ai_trade_journal(symbol, magic)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_ai_trade_journal_order_ticket ON ai_trade_journal(broker_order_ticket)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_ai_trade_journal_position_ticket ON ai_trade_journal(broker_position_ticket)")
+
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS ai_ob_observations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at TEXT NOT NULL,
+                original_journal_id INTEGER,
+                symbol TEXT,
+                decision TEXT,
+                direction TEXT,
+                original_ob_timeframe TEXT,
+                original_ob_high REAL,
+                original_ob_low REAL,
+                original_entry REAL,
+                new_ob_timeframe TEXT,
+                new_ob_type TEXT,
+                new_ob_high REAL,
+                new_ob_low REAL,
+                new_ob_time TEXT,
+                distance_from_original_entry_pips REAL,
+                current_price REAL,
+                observation_json TEXT,
+                outcome_status TEXT,
+                outcome_notes TEXT
+            )
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_ai_ob_observations_origin ON ai_ob_observations(original_journal_id)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_ai_ob_observations_symbol_time ON ai_ob_observations(symbol, created_at)"
+        )
         conn.commit()
 
 
@@ -326,6 +359,110 @@ def get_active_journal_rows() -> Iterable[sqlite3.Row]:
         ).fetchall()
 
     return rows
+
+
+def get_latest_active_setup(symbol: str, magic: int) -> Optional[sqlite3.Row]:
+    """
+    Active setup means a still-relevant locked setup or pending/open lifecycle row.
+    """
+    init_db()
+    statuses = (
+        "ORDER_PLACED",
+        "PENDING_ACTIVE",
+        "FILLED_OPEN",
+        "ORDER_UNKNOWN",
+        "DRY_RUN",
+    )
+    placeholders = ",".join(["?"] * len(statuses))
+    with connect_db() as conn:
+        row = conn.execute(
+            f"""
+            SELECT *
+            FROM ai_trade_journal
+            WHERE symbol = ?
+              AND magic = ?
+              AND status IN ({placeholders})
+              AND entry IS NOT NULL
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (symbol, int(magic), *statuses),
+        ).fetchone()
+    return row
+
+
+def record_ob_observation(
+    *,
+    original_journal_id: int,
+    symbol: str,
+    decision: str,
+    direction: str,
+    original_ob_timeframe: str,
+    original_ob_high: float,
+    original_ob_low: float,
+    original_entry: float,
+    new_ob_timeframe: str,
+    new_ob_type: str,
+    new_ob_high: float,
+    new_ob_low: float,
+    new_ob_time: Any,
+    distance_from_original_entry_pips: float,
+    current_price: float,
+    observation_json: Optional[Dict[str, Any]] = None,
+    outcome_status: str = "PENDING",
+    outcome_notes: str = "",
+) -> int:
+    init_db()
+    now = utc_now()
+    with connect_db() as conn:
+        cur = conn.execute(
+            """
+            INSERT INTO ai_ob_observations (
+                created_at,
+                original_journal_id,
+                symbol,
+                decision,
+                direction,
+                original_ob_timeframe,
+                original_ob_high,
+                original_ob_low,
+                original_entry,
+                new_ob_timeframe,
+                new_ob_type,
+                new_ob_high,
+                new_ob_low,
+                new_ob_time,
+                distance_from_original_entry_pips,
+                current_price,
+                observation_json,
+                outcome_status,
+                outcome_notes
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                now,
+                int(original_journal_id),
+                symbol,
+                decision,
+                direction,
+                original_ob_timeframe,
+                original_ob_high,
+                original_ob_low,
+                original_entry,
+                new_ob_timeframe,
+                new_ob_type,
+                new_ob_high,
+                new_ob_low,
+                str(new_ob_time),
+                distance_from_original_entry_pips,
+                current_price,
+                dumps(observation_json or {}),
+                outcome_status,
+                outcome_notes,
+            ),
+        )
+        conn.commit()
+        return int(cur.lastrowid)
 
 
 def get_recent_rows(days: int = 1) -> Iterable[sqlite3.Row]:

@@ -36,12 +36,24 @@ ea-ai-platform/
 
 ### 1. Clone & configure
 
+The API and scripts load **`backend/.env`** (not a root `.env`).
+
 ```bash
-cp .env.example .env
-# Edit .env with your LLM API keys and settings
+# From the repository root:
+# Windows (cmd/PowerShell)
+copy .env.example backend\.env
+
+# Linux / macOS
+cp .env.example backend/.env
 ```
 
+Edit `backend/.env` with your LLM keys, MT5 paths (if used), and risk limits. See `.env.example` for every option.
+
+For server-style deployment notes, see [DEPLOYMENT_INSTRUCTIONS.txt](DEPLOYMENT_INSTRUCTIONS.txt).
+
 ### 2. Backend setup
+
+Always run backend commands from the **`backend`** directory so `./storage/...` paths resolve correctly.
 
 ```bash
 cd backend
@@ -55,6 +67,8 @@ pip install -r requirements.txt
 python -m app.database   # Initialize database
 uvicorn app.main:app --reload --port 8000
 ```
+
+On Windows you can alternatively start the API from the repo root with `.\start-backend.ps1` (uses the venv under `backend` if present).
 
 ### 3. Frontend setup
 
@@ -112,7 +126,12 @@ Once backend is running, visit:
 
 ## Environment Variables
 
-See `.env.example` for all configuration options.
+See `.env.example` at the repo root; copy it to **`backend/.env`** before running.
+
+### SMC tools (optional)
+
+- **MT5 chart overlay / diagnostics**: from `backend`, with MT5 connected, run `python test_smc_overlay.py` (uses `backend/.env` for toggles).
+- **CSV SMC backtest**: from `backend`, `python backtest_smc_strategy_from_csv.py --help` — outputs under `backend/storage/backtests/` (ignored by git).
 
 ---
 

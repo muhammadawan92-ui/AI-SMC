@@ -38,6 +38,26 @@ def bias_text(bias: int) -> str:
     return "Neutral"
 
 
+def env_bool(name: str, default: bool = False) -> bool:
+    value = os.getenv(name, str(default)).strip().lower()
+    return value in {"1", "true", "yes", "y", "on"}
+
+
+def get_visual_mode() -> str:
+    mode = os.getenv("SMC_VISUAL_MODE", "clean").strip().lower()
+    if mode not in {"clean", "trade", "debug"}:
+        return "clean"
+    return mode
+
+
+def get_latest_flip_candidate(candidates: dict):
+    valid = [v for v in candidates.values() if v and v.get("ob")]
+    if not valid:
+        return None
+    valid.sort(key=lambda x: x["ob"].get("time"))
+    return valid[-1]
+
+
 def connect_mt5():
     terminal_path = os.getenv("MT5_TERMINAL_PATH", "").strip()
 
@@ -604,6 +624,7 @@ def decide_trade_context(external_bias: int, current_location: str, internal_eve
 def select_active_ob(
     trade_direction,
     trade_mode,
+    internal_event_pack,
     m15_result,
     m5_result,
     m15,
@@ -614,7 +635,7 @@ def select_active_ob(
     fibs,
 ):
     if trade_direction is None:
-        return None, None, None, None
+        return None, None, None, None, "none", False
 
     poi_top = max(fibs[0.618], fibs[0.886])
     poi_bottom = min(fibs[0.618], fibs[0.886])
@@ -641,6 +662,36 @@ def select_active_ob(
             zone_high = discount_high
             zone_name = "discount_retracement_zone"
 
+    selected_ob_source = "fallback_last_valid"
+    selected_ob_locked = False
+
+    # Prefer the source OB that created the selected internal break event.
+    source_selected_ob = None
+    if internal_event_pack and internal_event_pack.get("event"):
+        source_event = internal_event_pack["event"]
+        source_ob = source_event.get("order_block")
+        source_tf = internal_event_pack.get("timeframe")
+        source_df = m15 if source_tf == "M15" else m5
+        if source_ob:
+            source_ok = (
+                source_ob.get("bias") == trade_direction
+                and not is_ob_invalidated(source_df, source_ob, use_close=True)
+                and ob_overlaps_zone(source_ob, zone_low, zone_high)
+            )
+            if source_ok:
+                source_selected_ob = dict(source_ob)
+                source_selected_ob["timeframe"] = source_tf
+                source_selected_ob["source_selected_ob"] = True
+                source_selected_ob["source_event"] = {
+                    "direction": source_event.get("direction"),
+                    "tag": source_event.get("tag"),
+                    "level": source_event.get("level"),
+                    "level_time": source_event.get("level_time"),
+                    "break_time": source_event.get("break_time"),
+                }
+                selected_ob_source = "internal_event_source"
+                selected_ob_locked = True
+
     m15_ob = last_valid_ob(
         m15_result["events"], m15, trade_direction, "M15",
         zone_low=zone_low, zone_high=zone_high
@@ -650,8 +701,8 @@ def select_active_ob(
         zone_low=zone_low, zone_high=zone_high
     )
 
-    selected_ob = most_recent_ob(m15_ob, m5_ob)
-    return selected_ob, m15_ob, m5_ob, zone_name
+    selected_ob = source_selected_ob if source_selected_ob else most_recent_ob(m15_ob, m5_ob)
+    return selected_ob, m15_ob, m5_ob, zone_name, selected_ob_source, selected_ob_locked
 
 
 def select_reference_zones(external_bias, h1_result, h1, m15_result, m15, m5_result, m5, swing_low, swing_high, equilibrium):
@@ -693,14 +744,14 @@ def get_entry_status(current_price, entry, trade_direction, point):
             return "PENDING_BUY_LIMIT"
         if abs(current_price - entry) <= allowed:
             return "AT_BUY_ENTRY"
-        return "BUY_ENTRY_ALREADY_MOVED"
+        return "BUY_LIMIT_NOT_CHASED"
 
     if trade_direction == BEARISH:
         if current_price > entry + allowed:
             return "PENDING_SELL_LIMIT"
         if abs(current_price - entry) <= allowed:
             return "AT_SELL_ENTRY"
-        return "SELL_ENTRY_ALREADY_MOVED"
+        return "SELL_LIMIT_NOT_CHASED"
 
     return "NO_ENTRY"
 
@@ -709,6 +760,102 @@ def get_latest_pivot_pair(result):
     last_high = result["pivot_highs"][-1] if result["pivot_highs"] else None
     last_low = result["pivot_lows"][-1] if result["pivot_lows"] else None
     return last_high, last_low
+
+
+def get_internal_structure_levels(result, df: pd.DataFrame, timeframe_label: str):
+    trend = result.get("trend", 0)
+    trend_text = "bullish" if trend == BULLISH else "bearish" if trend == BEARISH else "neutral"
+    piv_highs = result.get("pivot_highs", [])
+    piv_lows = result.get("pivot_lows", [])
+    events = result.get("events", [])
+    last_ev = events[-1] if events else None
+
+    strong_high = None
+    weak_high = piv_highs[-1] if piv_highs else None
+    strong_low = None
+    weak_low = piv_lows[-1] if piv_lows else None
+
+    if trend == BULLISH:
+        break_idx = int(last_ev["break_index"]) if last_ev and last_ev["bias"] == BULLISH else len(df) - 1
+        candidates = [p for p in piv_lows if int(p["index"]) <= break_idx]
+        strong_low = candidates[-1] if candidates else (piv_lows[-1] if piv_lows else None)
+    elif trend == BEARISH:
+        break_idx = int(last_ev["break_index"]) if last_ev and last_ev["bias"] == BEARISH else len(df) - 1
+        candidates = [p for p in piv_highs if int(p["index"]) <= break_idx]
+        strong_high = candidates[-1] if candidates else (piv_highs[-1] if piv_highs else None)
+
+    return {
+        "timeframe": timeframe_label,
+        "trend": trend_text,
+        "strong_high": strong_high,
+        "weak_high": weak_high,
+        "strong_low": strong_low,
+        "weak_low": weak_low,
+        "last_events": events[-3:],
+    }
+
+
+def detect_ob_flip_candidates(m15_result, m5_result, m15, m5, current_price):
+    def _latest_ob(events, bias: int):
+        for e in reversed(events):
+            if e.get("bias") == bias and e.get("order_block"):
+                return e["order_block"], e
+        return None, None
+
+    def _invalidated(ob: dict | None, df: pd.DataFrame):
+        if not ob:
+            return False
+        return is_ob_invalidated(df, ob, use_close=True)
+
+    out = {
+        "m5_bullish_flip": None,
+        "m5_bearish_flip": None,
+        "m15_bullish_flip": None,
+        "m15_bearish_flip": None,
+    }
+
+    m5_supply, m5_supply_event = _latest_ob(m5_result["events"], BEARISH)
+    m5_demand, m5_demand_event = _latest_ob(m5_result["events"], BULLISH)
+    m15_supply, m15_supply_event = _latest_ob(m15_result["events"], BEARISH)
+    m15_demand, m15_demand_event = _latest_ob(m15_result["events"], BULLISH)
+
+    if m5_supply and _invalidated(m5_supply, m5):
+        out["m5_bullish_flip"] = {
+            "timeframe": "M5",
+            "invalidated_ob_type": "supply",
+            "ob": m5_supply,
+            "source_event": m5_supply_event,
+            "message": "SUPPLY INVALIDATED | BULLISH FLIP CANDIDATE",
+            "current_price": current_price,
+        }
+    if m5_demand and _invalidated(m5_demand, m5):
+        out["m5_bearish_flip"] = {
+            "timeframe": "M5",
+            "invalidated_ob_type": "demand",
+            "ob": m5_demand,
+            "source_event": m5_demand_event,
+            "message": "DEMAND INVALIDATED | BEARISH FLIP CANDIDATE",
+            "current_price": current_price,
+        }
+    if m15_supply and _invalidated(m15_supply, m15):
+        out["m15_bullish_flip"] = {
+            "timeframe": "M15",
+            "invalidated_ob_type": "supply",
+            "ob": m15_supply,
+            "source_event": m15_supply_event,
+            "message": "SUPPLY INVALIDATED | BULLISH FLIP CANDIDATE",
+            "current_price": current_price,
+        }
+    if m15_demand and _invalidated(m15_demand, m15):
+        out["m15_bearish_flip"] = {
+            "timeframe": "M15",
+            "invalidated_ob_type": "demand",
+            "ob": m15_demand,
+            "source_event": m15_demand_event,
+            "message": "DEMAND INVALIDATED | BEARISH FLIP CANDIDATE",
+            "current_price": current_price,
+        }
+    return out
 
 
 def build_overlay(symbol: str):
@@ -761,9 +908,10 @@ def build_overlay(symbol: str):
         swing_high,
     )
 
-    selected_ob, m15_ob, m5_ob, zone_name = select_active_ob(
+    selected_ob, m15_ob, m5_ob, zone_name, selected_ob_source, selected_ob_locked = select_active_ob(
         trade_direction,
         trade_mode,
+        internal_event_pack,
         m15_result,
         m5_result,
         m15,
@@ -787,7 +935,46 @@ def build_overlay(symbol: str):
         equilibrium,
     )
 
+    internal_m5_structure = get_internal_structure_levels(m5_result, m5, "M5")
+    internal_m15_structure = get_internal_structure_levels(m15_result, m15, "M15")
+    ob_flip_candidates = detect_ob_flip_candidates(m15_result, m5_result, m15, m5, current_price)
+
+    show_ob_invalidations = os.getenv("SMC_SHOW_OB_INVALIDATIONS", "true").lower() == "true"
+    flip_visual_only = os.getenv("SMC_FLIP_CANDIDATE_VISUAL_ONLY", "true").lower() == "true"
+    diagnostic_decision = None
+    if show_ob_invalidations and flip_visual_only:
+        has_bull_flip = bool(ob_flip_candidates["m5_bullish_flip"] or ob_flip_candidates["m15_bullish_flip"])
+        has_bear_flip = bool(ob_flip_candidates["m5_bearish_flip"] or ob_flip_candidates["m15_bearish_flip"])
+        if external_bias == BULLISH and current_location == "premium" and has_bull_flip:
+            diagnostic_decision = "WAIT_BUY_PULLBACK_AFTER_SUPPLY_INVALIDATION"
+            decision = diagnostic_decision
+            trade_mode = "diagnostic"
+            trade_direction = None
+            selected_ob = None
+            zone_name = "bullish_flip_reference"
+        elif external_bias == BEARISH and current_location == "discount" and has_bear_flip:
+            diagnostic_decision = "WAIT_SELL_PULLBACK_AFTER_DEMAND_INVALIDATION"
+            decision = diagnostic_decision
+            trade_mode = "diagnostic"
+            trade_direction = None
+            selected_ob = None
+            zone_name = "bearish_flip_reference"
+
+    latest_flip = get_latest_flip_candidate(ob_flip_candidates)
+
     lines = []
+
+    visual_mode = get_visual_mode()
+    is_clean_visual = visual_mode == "clean"
+    is_trade_visual = visual_mode == "trade"
+    is_debug_visual = visual_mode == "debug"
+
+    # Clean mode should be a trading dashboard, not a debug chart.
+    show_reference_zones = env_bool("SMC_SHOW_REFERENCE_ZONES", default=not is_clean_visual)
+    show_h1_structure = env_bool("SMC_SHOW_H1_STRUCTURE", default=not is_clean_visual)
+    show_h1_strong_weak = env_bool("SMC_SHOW_H1_STRONG_WEAK", default=not is_clean_visual)
+    show_chart_flip_zones = env_bool("SMC_SHOW_FLIP_ZONES_ON_CHART", default=is_debug_visual)
+    show_fib_labels_minimal = env_bool("SMC_SHOW_FIB_LABELS_MINIMAL", default=True)
 
     # DASHBOARD
     external_text = bias_text(external_bias)
@@ -803,6 +990,13 @@ def build_overlay(symbol: str):
     add_label(lines, "AI_SMC_DASHBOARD_3", 12, 62, f"Internal: {internal_text}", "white")
     add_label(lines, "AI_SMC_DASHBOARD_4", 12, 82, f"Decision: {decision} | Mode: {trade_mode}", "white")
 
+    dashboard_status_y = 102
+    dashboard_active_y = 122
+    if latest_flip:
+        add_label(lines, "AI_SMC_DASHBOARD_FLIP", 12, 102, f"Flip: {latest_flip['timeframe']} {latest_flip['message']}", "orange")
+        dashboard_status_y = 122
+        dashboard_active_y = 142
+
     fib_start_time = min(swing_low_time, swing_high_time)
     fib_end_time = right_time
 
@@ -817,19 +1011,22 @@ def build_overlay(symbol: str):
         0.886: -22,
     }
 
-    for level, color in [
+    fib_levels_to_draw = [(0.618, "yellow"), (0.886, "orange")] if (is_clean_visual and show_fib_labels_minimal) else [
         (0.618, "yellow"),
         (0.705, "yellow"),
         (0.79, "yellow"),
         (0.886, "orange"),
-    ]:
+    ]
+
+    for level, color in fib_levels_to_draw:
         name = str(level).replace(".", "_")
         y = fibs[level]
         add_line(lines, f"AI_SMC_FIB_{name}", fib_start_time, fib_end_time, y, y, "", color)
-        add_text(lines, f"AI_SMC_FIB_{name}_TEXT", right_time, y + point * fib_label_offsets[level], str(level), color)
+        if not is_clean_visual or not show_fib_labels_minimal:
+            add_text(lines, f"AI_SMC_FIB_{name}_TEXT", right_time, y + point * fib_label_offsets[level], str(level), color)
 
     # EXTERNAL STRUCTURE
-    if h1_last_event:
+    if h1_last_event and show_h1_structure:
         event_color = "green" if h1_last_event["bias"] == BULLISH else "red"
         event_label = f"H1 {h1_last_event['direction'].upper()} {h1_last_event['tag']}"
 
@@ -852,19 +1049,31 @@ def build_overlay(symbol: str):
             event_color,
         )
 
-    if external_bias == BULLISH:
+    if show_h1_strong_weak and external_bias == BULLISH:
         add_line(lines, "AI_SMC_STRONG_LOW", swing_low_time, right_time, swing_low, swing_low, "", "green")
         add_line(lines, "AI_SMC_WEAK_HIGH", swing_high_time, right_time, swing_high, swing_high, "", "red")
         add_text(lines, "AI_SMC_STRONG_LOW_TEXT", swing_low_time, swing_low - point * 22, "Strong Low", "green")
         add_text(lines, "AI_SMC_WEAK_HIGH_TEXT", swing_high_time, swing_high + point * 22, "Weak High", "red")
-    else:
+    elif show_h1_strong_weak:
         add_line(lines, "AI_SMC_STRONG_HIGH", swing_high_time, right_time, swing_high, swing_high, "", "red")
         add_line(lines, "AI_SMC_WEAK_LOW", swing_low_time, right_time, swing_low, swing_low, "", "green")
         add_text(lines, "AI_SMC_STRONG_HIGH_TEXT", swing_high_time, swing_high + point * 22, "Strong High", "red")
         add_text(lines, "AI_SMC_WEAK_LOW_TEXT", swing_low_time, swing_low - point * 22, "Weak Low", "green")
 
     # INTERNAL STRUCTURE
-    if internal_event_pack:
+    # Visual mode controls defaults only. Explicit .env flags should always win.
+    # If the user enables internal swings or strong/weak levels in clean mode,
+    # also show the latest internal BOS/CHoCH context line so the chart matches .env.
+    internal_related_enabled = (
+        env_bool("SMC_SHOW_INTERNAL_SWINGS", default=False)
+        or env_bool("SMC_SHOW_INTERNAL_STRONG_WEAK", default=False)
+        or env_bool("SMC_CLEAN_SHOW_INTERNAL_STRONG_WEAK", default=False)
+    )
+    show_internal_structure = env_bool(
+        "SMC_SHOW_INTERNAL_STRUCTURE",
+        default=(not is_clean_visual or internal_related_enabled),
+    )
+    if internal_event_pack and show_internal_structure:
         internal_tf = internal_event_pack["timeframe"]
         internal_event = internal_event_pack["event"]
         internal_color = "green" if internal_event["bias"] == BULLISH else "red"
@@ -890,7 +1099,12 @@ def build_overlay(symbol: str):
         )
 
     # INTERNAL SWINGS
-    show_internal_swings = os.getenv("SMC_SHOW_INTERNAL_SWINGS", "true").lower() == "true"
+    # Previously this was forced off in clean mode. Now SMC_SHOW_INTERNAL_SWINGS=true
+    # will show the active M5/M15 swing references in any visual mode.
+    show_internal_swings = env_bool(
+        "SMC_SHOW_INTERNAL_SWINGS",
+        default=(is_debug_visual or is_trade_visual),
+    )
 
     if show_internal_swings:
         if internal_event_pack and internal_event_pack["timeframe"] == "M15":
@@ -910,8 +1124,119 @@ def build_overlay(symbol: str):
             add_line(lines, "AI_SMC_INTERNAL_SWING_LOW", last_il["time"], right_time, last_il["price"], last_il["price"], "", "cyan")
             add_text(lines, "AI_SMC_INTERNAL_SWING_LOW_TEXT", last_il["time"], last_il["price"] - point * 18, f"{internal_tf} swing low", "cyan")
 
-    # REFERENCE ZONE 1: H1 SOURCE ZONE (blue area user marked)
-    if h1_source_ob:
+    if is_clean_visual:
+        # In clean mode, keep default off, but respect the normal .env flag if the user enables it.
+        # Backward compatible: SMC_CLEAN_SHOW_INTERNAL_STRONG_WEAK=true also works.
+        show_internal_strong_weak = (
+            env_bool("SMC_SHOW_INTERNAL_STRONG_WEAK", default=False)
+            or env_bool("SMC_CLEAN_SHOW_INTERNAL_STRONG_WEAK", default=False)
+        )
+    else:
+        show_internal_strong_weak = env_bool("SMC_SHOW_INTERNAL_STRONG_WEAK", default=True)
+
+    if show_internal_strong_weak:
+        def _draw_internal_levels(levels: dict, color: str, text_color: str):
+            tf = levels["timeframe"]
+            trend = levels.get("trend")
+
+            # In clean/trade mode, show only the two decision-useful levels for the current trend.
+            draw_all = is_debug_visual
+
+            if levels.get("strong_low") and (draw_all or trend == "bullish"):
+                p = float(levels["strong_low"]["price"])
+                t = levels["strong_low"]["time"]
+                add_line(lines, f"AI_SMC_{tf}_STRONG_LOW", t, right_time, p, p, "", color)
+                add_text(lines, f"AI_SMC_{tf}_STRONG_LOW_TEXT", right_time, p - point * 14, f"{tf} Strong Low", text_color)
+            if levels.get("weak_high") and (draw_all or trend == "bullish"):
+                p = float(levels["weak_high"]["price"])
+                t = levels["weak_high"]["time"]
+                add_line(lines, f"AI_SMC_{tf}_WEAK_HIGH", t, right_time, p, p, "", "white")
+                add_text(lines, f"AI_SMC_{tf}_WEAK_HIGH_TEXT", right_time, p + point * 14, f"{tf} Weak High", "white")
+            if levels.get("strong_high") and (draw_all or trend == "bearish"):
+                p = float(levels["strong_high"]["price"])
+                t = levels["strong_high"]["time"]
+                add_line(lines, f"AI_SMC_{tf}_STRONG_HIGH", t, right_time, p, p, "", color)
+                add_text(lines, f"AI_SMC_{tf}_STRONG_HIGH_TEXT", right_time, p + point * 14, f"{tf} Strong High", text_color)
+            if levels.get("weak_low") and (draw_all or trend == "bearish"):
+                p = float(levels["weak_low"]["price"])
+                t = levels["weak_low"]["time"]
+                add_line(lines, f"AI_SMC_{tf}_WEAK_LOW", t, right_time, p, p, "", "white")
+                add_text(lines, f"AI_SMC_{tf}_WEAK_LOW_TEXT", right_time, p - point * 14, f"{tf} Weak Low", "white")
+
+        if is_debug_visual:
+            _draw_internal_levels(internal_m5_structure, "cyan", "cyan")
+            _draw_internal_levels(internal_m15_structure, "magenta", "magenta")
+        else:
+            active_tf = internal_event_pack["timeframe"] if internal_event_pack else "M5"
+            active_levels = internal_m15_structure if active_tf == "M15" else internal_m5_structure
+            _draw_internal_levels(active_levels, "cyan", "cyan")
+
+    # Previous structure is now controlled directly by .env.
+    # Default remains false, but if SMC_SHOW_PREVIOUS_STRUCTURE=true it will show in clean/trade/debug.
+    show_previous_structure = env_bool("SMC_SHOW_PREVIOUS_STRUCTURE", default=False)
+    previous_structure_count = int(os.getenv("SMC_PREVIOUS_STRUCTURE_COUNT", "1"))
+    if show_previous_structure and previous_structure_count > 0:
+        def _draw_previous_events(result: dict, tf: str, color_base: str):
+            events = result.get("events", [])[-previous_structure_count:]
+            for idx, ev in enumerate(events):
+                c = "teal" if ev["bias"] == BULLISH else "maroon"
+                tag = f"{tf} {'Bullish' if ev['bias']==BULLISH else 'Bearish'} {ev['tag']}"
+                add_line(
+                    lines,
+                    f"AI_SMC_{tf}_PREV_{idx}",
+                    ev["level_time"],
+                    ev["break_time"],
+                    ev["level"],
+                    ev["level"],
+                    "",
+                    c if color_base == "" else color_base,
+                )
+                add_text(
+                    lines,
+                    f"AI_SMC_{tf}_PREV_TEXT_{idx}",
+                    ev["break_time"],
+                    ev["level"] + point * (10 + 8 * idx),
+                    tag,
+                    "gray",
+                )
+        _draw_previous_events(m5_result, "M5", "")
+        _draw_previous_events(m15_result, "M15", "")
+
+    if show_ob_invalidations and show_chart_flip_zones:
+        def _draw_flip(flip: dict | None, name: str, color: str):
+            if not flip:
+                return
+            ob = flip["ob"]
+            add_rect(
+                lines,
+                f"AI_SMC_{name}_OB",
+                ob["time"],
+                right_time,
+                ob["high"],
+                ob["low"],
+                "",
+                color,
+            )
+            add_text(
+                lines,
+                f"AI_SMC_{name}_TEXT",
+                right_time,
+                (ob["high"] + ob["low"]) / 2.0,
+                flip["message"],
+                color,
+            )
+
+        if is_debug_visual:
+            _draw_flip(ob_flip_candidates["m5_bullish_flip"], "M5_BULL_FLIP", "lime")
+            _draw_flip(ob_flip_candidates["m5_bearish_flip"], "M5_BEAR_FLIP", "orange")
+            _draw_flip(ob_flip_candidates["m15_bullish_flip"], "M15_BULL_FLIP", "green")
+            _draw_flip(ob_flip_candidates["m15_bearish_flip"], "M15_BEAR_FLIP", "red")
+        elif latest_flip:
+            color = "lime" if latest_flip["invalidated_ob_type"] == "supply" else "orange"
+            _draw_flip(latest_flip, f"{latest_flip['timeframe']}_LATEST_FLIP", color)
+
+    # REFERENCE ZONE 1: H1 SOURCE ZONE (hidden in clean mode by default)
+    if h1_source_ob and show_reference_zones:
         source_color = "blue" if h1_source_ob["bias"] == BULLISH else "orange"
         source_label = "H1 SOURCE DEMAND" if h1_source_ob["bias"] == BULLISH else "H1 SOURCE SUPPLY"
 
@@ -934,8 +1259,8 @@ def build_overlay(symbol: str):
             source_color,
         )
 
-    # REFERENCE ZONE 2: RETRACEMENT REACTION ZONE (red area user marked)
-    if retrace_ref_ob:
+    # REFERENCE ZONE 2: RETRACEMENT REACTION ZONE (hidden in clean mode by default)
+    if retrace_ref_ob and show_reference_zones:
         retrace_color = "magenta" if retrace_ref_ob["bias"] == BEARISH else "cyan"
         retrace_label = f"{retrace_ref_ob['timeframe']} RETRACE {'SUPPLY' if retrace_ref_ob['bias'] == BEARISH else 'DEMAND'}"
 
@@ -1003,6 +1328,8 @@ def build_overlay(symbol: str):
                 take_profit = entry - risk * rr
 
     entry_status = get_entry_status(current_price, entry, trade_direction, point)
+    if trade_mode == "diagnostic":
+        entry_status = "NO_ENTRY"
 
     if entry is not None and stop_loss is not None and take_profit is not None:
         trade_start_time = selected_ob["time"] if selected_ob else m5.iloc[-1]["time"]
@@ -1015,8 +1342,8 @@ def build_overlay(symbol: str):
         add_text(lines, "AI_SMC_SL_TEXT", right_time, stop_loss - point * 26, "SL", "red")
         add_text(lines, "AI_SMC_TP_TEXT", right_time, take_profit + point * 26, "TP 1:3", "green")
 
-    add_label(lines, "AI_SMC_DASHBOARD_5", 12, 102, f"Status: {entry_status}", "white")
-    add_label(lines, "AI_SMC_DASHBOARD_6", 12, 122, f"Active zone: {zone_name}", "white")
+    add_label(lines, "AI_SMC_DASHBOARD_5", 12, dashboard_status_y, f"Status: {entry_status}", "white")
+    add_label(lines, "AI_SMC_DASHBOARD_6", 12, dashboard_active_y, f"Active zone: {zone_name}", "white")
 
     output_path = mt5_common_files_dir() / "AI_SMC_OVERLAY.csv"
     output_path.write_text("\n".join(lines), encoding="utf-8")
@@ -1051,9 +1378,26 @@ def build_overlay(symbol: str):
         "h1_source_ob": h1_source_ob,
         "retrace_reference_ob": retrace_ref_ob,
         "selected_ob": selected_ob,
+        "selected_ob_source": selected_ob_source,
+        "selected_ob_locked": selected_ob_locked,
         "entry": entry,
         "stop_loss": stop_loss,
         "take_profit": take_profit,
+        "internal_m5_structure": internal_m5_structure,
+        "internal_m15_structure": internal_m15_structure,
+        "ob_flip_candidates": ob_flip_candidates,
+        "diagnostic_decision": diagnostic_decision,
+        "visual_mode": visual_mode,
+        "visual_flags": {
+            "show_reference_zones": show_reference_zones,
+            "show_h1_structure": show_h1_structure,
+            "show_h1_strong_weak": show_h1_strong_weak,
+            "show_internal_structure": show_internal_structure,
+            "show_internal_swings": show_internal_swings,
+            "show_internal_strong_weak": show_internal_strong_weak,
+            "show_previous_structure": show_previous_structure,
+            "show_chart_flip_zones": show_chart_flip_zones,
+        },
         "overlay_file": str(output_path),
     }
 
