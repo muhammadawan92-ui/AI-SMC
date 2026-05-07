@@ -463,6 +463,20 @@ def main() -> None:
                         active["state"] = "open"
                         active["fill_time"] = now
             if active and active["state"] == "open":
+                # Track intra-trade extremes in R multiples (MFE/MAE) using the current M5 candle range.
+                risk_price = float(active.get("risk_price") or abs(active["entry"] - active["stop_loss"]))
+                entry_price = float(active["entry"])
+                if risk_price > 0:
+                    if active["direction"] == "buy":
+                        r_fav = (c_high - entry_price) / risk_price
+                        r_adv = (c_low - entry_price) / risk_price
+                    else:
+                        # For sells, favorable move is price moving down.
+                        r_fav = (entry_price - c_low) / risk_price
+                        r_adv = (entry_price - c_high) / risk_price
+                    active["max_favorable_r"] = max(float(active.get("max_favorable_r", 0.0)), float(r_fav))
+                    active["max_adverse_r"] = min(float(active.get("max_adverse_r", 0.0)), float(r_adv))
+
                 exit_hit = classify_tick_exit(active["direction"], tick_slice, active["stop_loss"], active["take_profit"])
                 if exit_hit is None:
                     exit_hit = classify_candle_exit(
@@ -536,6 +550,10 @@ def main() -> None:
                     "result": "",
                     "profit": 0.0,
                     "r_multiple": 0.0,
+                    # MFE/MAE tracking (R multiples) + risk calibration for those calculations.
+                    "max_favorable_r": 0.0,
+                    "max_adverse_r": 0.0,
+                    "risk_price": abs(float(candidate["entry"]) - float(candidate["stop_loss"])),
                     "balance_after": balance,
                     "max_drawdown_at_trade": max_drawdown,
                     "h1_bias": "bullish" if external_bias == BULLISH else "bearish",
@@ -586,8 +604,164 @@ def main() -> None:
     avg_r = sum(t["r_multiple"] for t in closed_trades) / len(closed_trades) if closed_trades else 0.0
     best_r = max((t["r_multiple"] for t in closed_trades), default=0.0)
     worst_r = min((t["r_multiple"] for t in closed_trades), default=0.0)
+    avg_mfe_r = (
+        sum(float(t.get("max_favorable_r", 0.0)) for t in closed_trades) / len(closed_trades) if closed_trades else 0.0
+    )
+    avg_mae_r = (
+        sum(float(t.get("max_adverse_r", 0.0)) for t in closed_trades) / len(closed_trades) if closed_trades else 0.0
+    )
     max_dd_pct = (max_drawdown / peak_balance * 100.0) if peak_balance > 0 else 0.0
     win_rate = (wins / (wins + losses) * 100.0) if (wins + losses) > 0 else 0.0
+
+    def infer_symbol_from_csv_path(path_str: str) -> str:
+        # Typical MT5 file names: GBPUSD_mt5_bars.csv → GBPUSD
+        stem = Path(path_str).stem
+        return stem.split("_")[0] if "_" in stem else stem
+
+    def make_group_key(decision: str, trade_mode: str, ob_timeframe: str) -> str:
+        return f"decision={decision}|trade_mode={trade_mode}|ob_timeframe={ob_timeframe}"
+
+    def group_trades_by_key(trade_rows: list[dict[str, Any]]):
+        grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        for tr in trade_rows:
+            key = make_group_key(
+                str(tr.get("decision") or ""),
+                str(tr.get("trade_mode") or ""),
+                str(tr.get("ob_timeframe") or ""),
+            )
+            grouped[key].append(tr)
+        return grouped
+
+    def best_and_worst_by_avg_r(trade_rows: list[dict[str, Any]], key_field: str) -> tuple[str, str]:
+        avgs: dict[str, float] = {}
+        for tr in trade_rows:
+            k = str(tr.get(key_field) or "")
+            avgs.setdefault(k, 0.0)
+        # accumulate sums and counts
+        sums: dict[str, float] = {}
+        counts: dict[str, int] = {}
+        for tr in trade_rows:
+            k = str(tr.get(key_field) or "")
+            sums[k] = sums.get(k, 0.0) + float(tr.get("r_multiple", 0.0))
+            counts[k] = counts.get(k, 0) + 1
+        for k, s in sums.items():
+            if counts.get(k, 0) > 0:
+                avgs[k] = s / counts[k]
+        # prefer non-empty keys
+        candidates = [(k, v) for k, v in avgs.items() if k != ""]
+        if not candidates:
+            return "N/A", "N/A"
+        best_key = max(candidates, key=lambda x: x[1])[0]
+        worst_key = min(candidates, key=lambda x: x[1])[0]
+        return best_key, worst_key
+
+    best_decision_type, worst_decision_type = best_and_worst_by_avg_r(closed_trades, "decision")
+    best_ob_timeframe, worst_ob_timeframe = best_and_worst_by_avg_r(closed_trades, "ob_timeframe")
+
+    # Build an "expected by group" map so forward-testing comparisons can match by:
+    # decision + trade_mode + OB timeframe (without changing any parameters).
+    expected_by_group: dict[str, Any] = {}
+    for group_key, group_rows in group_trades_by_key(closed_trades).items():
+        g_wins = sum(1 for r in group_rows if r.get("result") == "WIN")
+        g_losses = sum(1 for r in group_rows if r.get("result") == "LOSS")
+        g_total = len(group_rows)
+        g_win_rate = (g_wins / g_total * 100.0) if g_total > 0 else 0.0
+        g_gross_profit = sum(float(r["profit"]) for r in group_rows if float(r.get("profit", 0.0)) > 0)
+        g_gross_loss = abs(sum(float(r["profit"]) for r in group_rows if float(r.get("profit", 0.0)) < 0))
+        g_profit_factor = (g_gross_profit / g_gross_loss) if g_gross_loss > 0 else 0.0
+        g_avg_r = (
+            sum(float(r.get("r_multiple", 0.0)) for r in group_rows) / g_total if g_total > 0 else 0.0
+        )
+        g_avg_mfe_r = (
+            sum(float(r.get("max_favorable_r", 0.0)) for r in group_rows) / g_total if g_total > 0 else 0.0
+        )
+        g_avg_mae_r = (
+            sum(float(r.get("max_adverse_r", 0.0)) for r in group_rows) / g_total if g_total > 0 else 0.0
+        )
+        expected_by_group[group_key] = {
+            "total_trades": int(g_total),
+            "win_rate": round(g_win_rate, 2),
+            "profit_factor": round(g_profit_factor, 4),
+            "average_r": round(g_avg_r, 4),
+            "average_mfe_r": round(g_avg_mfe_r, 4),
+            "average_mae_r": round(g_avg_mae_r, 4),
+            "wins": int(g_wins),
+            "losses": int(g_losses),
+        }
+
+    # Write "latest backtest knowledge" for forward comparison.
+    backend_repo_root = backend_dir.parent
+    knowledge_dir = backend_repo_root / "storage" / "knowledge"
+    knowledge_dir.mkdir(parents=True, exist_ok=True)
+    strategy_version = (os.getenv("STRATEGY_VERSION", "v1_active") or "v1_active").strip()
+    symbol = infer_symbol_from_csv_path(args.bars_csv)
+
+    recommendation = (
+        f"Forward demo: prioritize {best_decision_type} setups with OB timeframe {best_ob_timeframe}. "
+        f"Use the pending/OB lock safety defaults and be cautious with {worst_decision_type} / {worst_ob_timeframe} "
+        f"until forward evidence improves."
+        if best_decision_type != "N/A"
+        else "Forward demo: run a conservative sample first, then narrow focus based on forward outcome matching."
+    )
+
+    backtest_date_range = {"start": str(bars["time"].min()), "end": str(bars["time"].max())}
+    knowledge_latest = {
+        "strategy_version": strategy_version,
+        "symbol": symbol,
+        "backtest_date_range": backtest_date_range,
+        "total_trades": int(wins + losses),
+        "win_rate": round(win_rate, 2),
+        "profit_factor": round(profit_factor, 4),
+        "max_drawdown": round(max_drawdown, 2),
+        "final_balance": round(balance, 2),
+        "best_decision_type": best_decision_type,
+        "worst_decision_type": worst_decision_type,
+        "best_ob_timeframe": best_ob_timeframe,
+        "worst_ob_timeframe": worst_ob_timeframe,
+        "average_mfe_r": round(avg_mfe_r, 4),
+        "average_mae_r": round(avg_mae_r, 4),
+        "recommendation_for_forward_demo_testing": recommendation,
+        "expected_by_group": expected_by_group,
+        "generated_at": pd.Timestamp.now().isoformat(),
+        "inputs": {
+            "bars_csv": str(args.bars_csv),
+            "ticks_csv": str(args.ticks_csv) if args.ticks_csv else "",
+            "rr": settings.rr,
+            "ob_buffer_pips": settings.ob_buffer_pips,
+            "use_ticks": bool(settings.use_ticks),
+        },
+    }
+
+    knowledge_json_path = knowledge_dir / "backtest_knowledge_latest.json"
+    knowledge_txt_path = knowledge_dir / "backtest_knowledge_latest.txt"
+    knowledge_json_path.write_text(json.dumps(knowledge_latest, default=str, indent=2), encoding="utf-8")
+
+    knowledge_txt_lines = [
+        "BACKTEST KNOWLEDGE (LATEST)",
+        "",
+        f"Strategy version: {strategy_version}",
+        f"Symbol: {symbol}",
+        f"Backtest date range: {backtest_date_range['start']} -> {backtest_date_range['end']}",
+        f"Total trades: {wins + losses}",
+        f"Win rate: {round(win_rate, 2)}%",
+        f"Profit factor: {round(profit_factor, 4)}",
+        f"Max drawdown: {round(max_drawdown, 2)}",
+        f"Final balance: {round(balance, 2)}",
+        "",
+        f"Best decision type: {best_decision_type}",
+        f"Worst decision type: {worst_decision_type}",
+        f"Best OB timeframe: {best_ob_timeframe}",
+        f"Worst OB timeframe: {worst_ob_timeframe}",
+        "",
+        f"Average MFE R: {round(avg_mfe_r, 4)}",
+        f"Average MAE R: {round(avg_mae_r, 4)}",
+        "",
+        "Recommendation for forward demo testing:",
+        f"{recommendation}",
+        "",
+        f"Generated at: {knowledge_latest['generated_at']}",
+    ]
+    knowledge_txt_path.write_text("\n".join(knowledge_txt_lines) + "\n", encoding="utf-8")
 
     out_dir = backend_dir / "storage" / "backtests"
     out_dir.mkdir(parents=True, exist_ok=True)

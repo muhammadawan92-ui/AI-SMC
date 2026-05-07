@@ -23,11 +23,14 @@ frontend/.env.local
 storage/uploads/*
 storage/reports/*
 storage/strategy_versions/*
+# Backtest-to-forward knowledge (runtime-generated)
+storage/knowledge/*
 # Entire backend/storage tree (nested uploads, SQLite WAL, backtests, logs)
 backend/storage/**
 !storage/uploads/.gitkeep
 !storage/reports/.gitkeep
 !storage/strategy_versions/.gitkeep
+!storage/knowledge/.gitkeep
 
 # OS / editor
 .DS_Store
