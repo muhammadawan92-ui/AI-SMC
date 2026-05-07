@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { Activity, AlertTriangle, RefreshCw, Upload, Loader2, Shield, Zap } from "lucide-react";
+import { RefreshCw, Upload, Loader2, Shield, Zap } from "lucide-react";
 import { mt5Api, projectsApi } from "@/lib/api";
 import { cn, fmtUsd, profitColor } from "@/lib/utils";
 import type { Project, MT5Position, TradeDecision } from "@/types";
@@ -265,8 +265,8 @@ export default function MT5Page() {
                   <td className="py-2 px-3 font-medium text-white">{p.symbol}</td>
                   <td className="py-2 px-3"><span className={cn("badge text-xs", p.type === "buy" ? "bg-green-900/30 text-green-400" : "bg-red-900/30 text-red-400")}>{p.type}</span></td>
                   <td className="py-2 px-3 text-gray-400">{p.volume}</td>
-                  <td className="py-2 px-3 text-gray-300">{(p as any).open_price ?? "—"}</td>
-                  <td className="py-2 px-3 text-gray-300">{(p as any).close_price ?? "—"}</td>
+                  <td className="py-2 px-3 text-gray-300">{p.open_price ?? "—"}</td>
+                  <td className="py-2 px-3 text-gray-300">{p.close_price ?? "—"}</td>
                   <td className={cn("py-2 px-3 font-medium", profitColor(p.profit))}>{fmtUsd(p.profit)}</td>
                   <td className="py-2 px-3 text-gray-500 text-xs">{p.open_time}</td>
                 </tr>

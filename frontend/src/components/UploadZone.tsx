@@ -2,7 +2,7 @@
 
 import { useCallback, useState } from "react";
 import { useDropzone } from "react-dropzone";
-import { Upload, FileText, Image, X, CheckCircle, Loader2 } from "lucide-react";
+import { Upload, Image as ImageIcon, X, CheckCircle, Loader2 } from "lucide-react";
 import { cn, fmtBytes } from "@/lib/utils";
 import { uploadsApi } from "@/lib/api";
 import type { FileType } from "@/types";
@@ -118,7 +118,7 @@ export function UploadZone({
             {status === "uploading" ? (
               <Loader2 size={32} className="text-brand-400 animate-spin" />
             ) : isImage ? (
-              <Image size={32} className="text-gray-500" />
+              <ImageIcon size={32} className="text-gray-500" />
             ) : (
               <Upload size={32} className="text-gray-500" />
             )}

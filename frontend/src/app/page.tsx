@@ -9,13 +9,12 @@ import { MetricCard, MetricGrid } from "@/components/MetricCard";
 import { ConfidenceGauge } from "@/components/ConfidenceGauge";
 import { MonthlyProfitChart, SessionChart } from "@/components/MonthlyChart";
 import { projectsApi, healthApi, analysisApi, versionsApi } from "@/lib/api";
-import { fmt, fmtUsd, fmtPct, profitColor, readinessLabel, readinessColor } from "@/lib/utils";
+import { fmt, fmtUsd, fmtPct, profitColor, readinessLabel } from "@/lib/utils";
 import { cn } from "@/lib/utils";
-import type { Project, BacktestReport, ConfidenceScore } from "@/types";
+import type { BacktestReport, ConfidenceScore } from "@/types";
 import Link from "next/link";
 
 export default function DashboardPage() {
-  const [projects, setProjects] = useState<Project[]>([]);
   const [activeProject, setActiveProject] = useState<Project | null>(null);
   const [baseline, setBaseline] = useState<BacktestReport | null>(null);
   const [bestScore, setBestScore] = useState<ConfidenceScore | null>(null);
@@ -29,7 +28,6 @@ export default function DashboardPage() {
           projectsApi.list(),
           healthApi.check(),
         ]);
-        setProjects(projRes.data);
         setSystemStatus(healthRes.data);
 
         if (projRes.data.length > 0) {

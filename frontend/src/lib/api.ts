@@ -146,3 +146,10 @@ export const tradingviewApi = {
 export const healthApi = {
   check: () => axios.get(`${API_BASE}/health`),
 };
+
+// ── Forward Validation ─────────────────────────────────────────────────────
+export const forwardValidationApi = {
+  latest: () => api.get("/forward-validation/latest"),
+  runCompare: (data?: { symbol?: string; strategy_version?: string }) =>
+    api.post("/forward-validation/run-compare", data || {}),
+};

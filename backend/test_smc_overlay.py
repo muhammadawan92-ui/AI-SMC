@@ -705,6 +705,76 @@ def select_active_ob(
     return selected_ob, m15_ob, m5_ob, zone_name, selected_ob_source, selected_ob_locked
 
 
+def get_flip_reference_ob(diagnostic_decision, internal_event_pack, m15_result, m5_result, m15, m5):
+    """
+    Return the source OB behind a diagnostic flip state.
+
+    This is visual/diagnostic only. It must not create an executable entry.
+    Example: WAIT_BUY_PULLBACK_AFTER_SUPPLY_INVALIDATION should still draw
+    the M5/M15 demand OB that produced the bullish BOS/CHoCH.
+    """
+    if not diagnostic_decision:
+        return None, "none", "No diagnostic decision active"
+
+    if diagnostic_decision == "WAIT_BUY_PULLBACK_AFTER_SUPPLY_INVALIDATION":
+        wanted_bias = BULLISH
+        label_side = "DEMAND"
+    elif diagnostic_decision == "WAIT_SELL_PULLBACK_AFTER_DEMAND_INVALIDATION":
+        wanted_bias = BEARISH
+        label_side = "SUPPLY"
+    else:
+        return None, "none", f"Unsupported diagnostic decision: {diagnostic_decision}"
+
+    # First preference: the OB stored on the currently selected internal BOS/CHoCH event.
+    if internal_event_pack and internal_event_pack.get("event"):
+        event = internal_event_pack["event"]
+        tf = internal_event_pack.get("timeframe", "M5")
+        df = m15 if tf == "M15" else m5
+        ob = event.get("order_block")
+
+        if event.get("bias") == wanted_bias and ob:
+            if not is_ob_invalidated(df, ob, use_close=True):
+                clean_ob = dict(ob)
+                clean_ob["timeframe"] = tf
+                clean_ob["source_selected_ob"] = True
+                clean_ob["diagnostic_only"] = True
+                clean_ob["source_event"] = {
+                    "direction": event.get("direction"),
+                    "tag": event.get("tag"),
+                    "level": event.get("level"),
+                    "level_time": event.get("level_time"),
+                    "break_time": event.get("break_time"),
+                }
+                clean_ob["diagnostic_label"] = f"{tf} FLIP {label_side} OB"
+                return clean_ob, "internal_event_source", None
+            return None, "internal_event_source_invalidated", "Internal event source OB is already invalidated"
+
+        if event.get("bias") == wanted_bias and not ob:
+            missing_reason = "Internal event has no source order_block"
+        else:
+            missing_reason = "Current internal event direction does not match diagnostic flip direction"
+    else:
+        missing_reason = "No internal event pack available"
+
+    # Second preference: latest valid OB in the same direction on the active internal timeframe,
+    # without premium/discount zone filtering. This is diagnostic only and keeps the chart useful
+    # when find_order_block() did not attach an OB to the event.
+    active_tf = internal_event_pack.get("timeframe", "M5") if internal_event_pack else "M5"
+    search_order = [("M5", m5_result, m5), ("M15", m15_result, m15)]
+    if active_tf == "M15":
+        search_order = [("M15", m15_result, m15), ("M5", m5_result, m5)]
+
+    for tf, result, df in search_order:
+        fallback_ob = last_valid_ob(result.get("events", []), df, wanted_bias, tf)
+        if fallback_ob:
+            fallback_ob = dict(fallback_ob)
+            fallback_ob["diagnostic_only"] = True
+            fallback_ob["diagnostic_label"] = f"{tf} FLIP {label_side} OB"
+            return fallback_ob, "fallback_latest_valid_same_direction", missing_reason
+
+    return None, "missing", missing_reason
+
+
 def select_reference_zones(external_bias, h1_result, h1, m15_result, m15, m5_result, m5, swing_low, swing_high, equilibrium):
     # H1 source zone
     h1_source_ob = last_valid_ob(h1_result["events"], h1, external_bias, "H1")
@@ -962,6 +1032,16 @@ def build_overlay(symbol: str):
 
     latest_flip = get_latest_flip_candidate(ob_flip_candidates)
 
+    flip_reference_ob, flip_reference_ob_source, flip_reference_ob_missing_reason = get_flip_reference_ob(
+        diagnostic_decision,
+        internal_event_pack,
+        m15_result,
+        m5_result,
+        m15,
+        m5,
+    )
+    flip_reference_ob_drawn = False
+
     lines = []
 
     visual_mode = get_visual_mode()
@@ -1061,18 +1141,7 @@ def build_overlay(symbol: str):
         add_text(lines, "AI_SMC_WEAK_LOW_TEXT", swing_low_time, swing_low - point * 22, "Weak Low", "green")
 
     # INTERNAL STRUCTURE
-    # Visual mode controls defaults only. Explicit .env flags should always win.
-    # If the user enables internal swings or strong/weak levels in clean mode,
-    # also show the latest internal BOS/CHoCH context line so the chart matches .env.
-    internal_related_enabled = (
-        env_bool("SMC_SHOW_INTERNAL_SWINGS", default=False)
-        or env_bool("SMC_SHOW_INTERNAL_STRONG_WEAK", default=False)
-        or env_bool("SMC_CLEAN_SHOW_INTERNAL_STRONG_WEAK", default=False)
-    )
-    show_internal_structure = env_bool(
-        "SMC_SHOW_INTERNAL_STRUCTURE",
-        default=(not is_clean_visual or internal_related_enabled),
-    )
+    show_internal_structure = env_bool("SMC_SHOW_INTERNAL_STRUCTURE", default=not is_clean_visual)
     if internal_event_pack and show_internal_structure:
         internal_tf = internal_event_pack["timeframe"]
         internal_event = internal_event_pack["event"]
@@ -1099,12 +1168,8 @@ def build_overlay(symbol: str):
         )
 
     # INTERNAL SWINGS
-    # Previously this was forced off in clean mode. Now SMC_SHOW_INTERNAL_SWINGS=true
-    # will show the active M5/M15 swing references in any visual mode.
-    show_internal_swings = env_bool(
-        "SMC_SHOW_INTERNAL_SWINGS",
-        default=(is_debug_visual or is_trade_visual),
-    )
+    # Respect .env directly. Earlier versions blocked this in clean mode.
+    show_internal_swings = env_bool("SMC_SHOW_INTERNAL_SWINGS", default=False)
 
     if show_internal_swings:
         if internal_event_pack and internal_event_pack["timeframe"] == "M15":
@@ -1124,15 +1189,11 @@ def build_overlay(symbol: str):
             add_line(lines, "AI_SMC_INTERNAL_SWING_LOW", last_il["time"], right_time, last_il["price"], last_il["price"], "", "cyan")
             add_text(lines, "AI_SMC_INTERNAL_SWING_LOW_TEXT", last_il["time"], last_il["price"] - point * 18, f"{internal_tf} swing low", "cyan")
 
-    if is_clean_visual:
-        # In clean mode, keep default off, but respect the normal .env flag if the user enables it.
-        # Backward compatible: SMC_CLEAN_SHOW_INTERNAL_STRONG_WEAK=true also works.
-        show_internal_strong_weak = (
-            env_bool("SMC_SHOW_INTERNAL_STRONG_WEAK", default=False)
-            or env_bool("SMC_CLEAN_SHOW_INTERNAL_STRONG_WEAK", default=False)
-        )
-    else:
-        show_internal_strong_weak = env_bool("SMC_SHOW_INTERNAL_STRONG_WEAK", default=True)
+    # Respect .env directly. If SMC_SHOW_INTERNAL_STRONG_WEAK=true, show it even in clean mode.
+    show_internal_strong_weak = env_bool(
+        "SMC_SHOW_INTERNAL_STRONG_WEAK",
+        default=env_bool("SMC_CLEAN_SHOW_INTERNAL_STRONG_WEAK", default=not is_clean_visual),
+    )
 
     if show_internal_strong_weak:
         def _draw_internal_levels(levels: dict, color: str, text_color: str):
@@ -1171,8 +1232,7 @@ def build_overlay(symbol: str):
             active_levels = internal_m15_structure if active_tf == "M15" else internal_m5_structure
             _draw_internal_levels(active_levels, "cyan", "cyan")
 
-    # Previous structure is now controlled directly by .env.
-    # Default remains false, but if SMC_SHOW_PREVIOUS_STRUCTURE=true it will show in clean/trade/debug.
+    # Respect .env directly. Keep false by default to avoid noise.
     show_previous_structure = env_bool("SMC_SHOW_PREVIOUS_STRUCTURE", default=False)
     previous_structure_count = int(os.getenv("SMC_PREVIOUS_STRUCTURE_COUNT", "1"))
     if show_previous_structure and previous_structure_count > 0:
@@ -1283,6 +1343,33 @@ def build_overlay(symbol: str):
             retrace_color,
         )
 
+    # DIAGNOSTIC FLIP REFERENCE OB
+    # Draws the source OB behind WAIT_BUY/WAIT_SELL pullback states without creating an executable entry.
+    if flip_reference_ob:
+        flip_ob_color = "green" if flip_reference_ob.get("bias") == BULLISH else "red"
+        flip_ob_label = flip_reference_ob.get("diagnostic_label") or (
+            f"{flip_reference_ob.get('timeframe', 'M5')} FLIP {'DEMAND' if flip_reference_ob.get('bias') == BULLISH else 'SUPPLY'} OB"
+        )
+        add_rect(
+            lines,
+            "AI_SMC_FLIP_REFERENCE_OB",
+            flip_reference_ob["time"],
+            right_time,
+            flip_reference_ob["high"],
+            flip_reference_ob["low"],
+            "",
+            flip_ob_color,
+        )
+        add_text(
+            lines,
+            "AI_SMC_FLIP_REFERENCE_OB_TEXT",
+            right_time,
+            (flip_reference_ob["high"] + flip_reference_ob["low"]) / 2.0 - point * 18,
+            flip_ob_label,
+            flip_ob_color,
+        )
+        flip_reference_ob_drawn = True
+
     # ACTIVE CURRENT OB
     if selected_ob:
         ob_color = "green" if selected_ob["bias"] == BULLISH else "red"
@@ -1387,16 +1474,20 @@ def build_overlay(symbol: str):
         "internal_m15_structure": internal_m15_structure,
         "ob_flip_candidates": ob_flip_candidates,
         "diagnostic_decision": diagnostic_decision,
-        "visual_mode": visual_mode,
+        "flip_reference_ob": flip_reference_ob,
+        "flip_reference_ob_source": flip_reference_ob_source,
+        "flip_reference_ob_drawn": flip_reference_ob_drawn,
+        "flip_reference_ob_missing_reason": flip_reference_ob_missing_reason,
         "visual_flags": {
-            "show_reference_zones": show_reference_zones,
-            "show_h1_structure": show_h1_structure,
-            "show_h1_strong_weak": show_h1_strong_weak,
-            "show_internal_structure": show_internal_structure,
-            "show_internal_swings": show_internal_swings,
-            "show_internal_strong_weak": show_internal_strong_weak,
-            "show_previous_structure": show_previous_structure,
-            "show_chart_flip_zones": show_chart_flip_zones,
+            "SMC_VISUAL_MODE": visual_mode,
+            "SMC_SHOW_REFERENCE_ZONES": show_reference_zones,
+            "SMC_SHOW_H1_STRUCTURE": show_h1_structure,
+            "SMC_SHOW_H1_STRONG_WEAK": show_h1_strong_weak,
+            "SMC_SHOW_INTERNAL_STRUCTURE": show_internal_structure,
+            "SMC_SHOW_INTERNAL_SWINGS": show_internal_swings,
+            "SMC_SHOW_INTERNAL_STRONG_WEAK": show_internal_strong_weak,
+            "SMC_SHOW_PREVIOUS_STRUCTURE": show_previous_structure,
+            "SMC_SHOW_FLIP_ZONES_ON_CHART": show_chart_flip_zones,
         },
         "overlay_file": str(output_path),
     }

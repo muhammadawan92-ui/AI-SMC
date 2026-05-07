@@ -1,13 +1,12 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { BarChart3, TrendingUp, TrendingDown, AlertTriangle, RefreshCw } from "lucide-react";
+import { BarChart3, AlertTriangle, RefreshCw } from "lucide-react";
 import { MetricCard, MetricGrid } from "@/components/MetricCard";
 import { MonthlyProfitChart, SessionChart } from "@/components/MonthlyChart";
 import { analysisApi, projectsApi } from "@/lib/api";
 import { fmt, fmtUsd, fmtPct, profitColor, cn } from "@/lib/utils";
 import type { BacktestReport, Project } from "@/types";
-import ReactMarkdown from "react-markdown";
 
 export default function BacktestPage() {
   const [projects, setProjects] = useState<Project[]>([]);

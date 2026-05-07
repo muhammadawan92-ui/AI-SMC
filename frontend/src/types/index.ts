@@ -138,6 +138,38 @@ export interface ConfidenceScore {
   version_id?: string;
 }
 
+export interface BacktestKnowledgeLatest {
+  strategy_version?: string;
+  symbol?: string;
+  backtest_date_range?: { start?: string; end?: string };
+  total_trades?: number;
+  win_rate?: number;
+  profit_factor?: number;
+  max_drawdown?: number;
+  final_balance?: number;
+  best_decision_type?: string;
+  worst_decision_type?: string;
+  best_ob_timeframe?: string;
+  worst_ob_timeframe?: string;
+  average_mfe_r?: number;
+  average_mae_r?: number;
+  recommendation_for_forward_demo_testing?: string;
+  expected_by_group?: Record<
+    string,
+    {
+      total_trades?: number;
+      win_rate?: number;
+      profit_factor?: number;
+      average_r?: number;
+      average_mfe_r?: number;
+      average_mae_r?: number;
+      wins?: number;
+      losses?: number;
+    }
+  >;
+  generated_at?: string;
+}
+
 export interface ScreenshotAnalysis {
   id: string;
   symbol?: string;
@@ -157,6 +189,7 @@ export interface MT5Position {
   type: string;
   volume: number;
   open_price: number;
+  close_price?: number;
   sl: number;
   tp: number;
   profit: number;

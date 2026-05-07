@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { GitBranch, Plus, CheckCircle, XCircle, BarChart2, Loader2 } from "lucide-react";
+import { GitBranch, CheckCircle, XCircle, BarChart2, Loader2 } from "lucide-react";
 import { ConfidenceGauge, ConfidenceBreakdown } from "@/components/ConfidenceGauge";
 import { versionsApi, analysisApi, projectsApi } from "@/lib/api";
 import { cn, readinessLabel, readinessColor, verdictColor } from "@/lib/utils";
@@ -16,7 +16,6 @@ export default function VersionsPage() {
   const [selectedVersion, setSelectedVersion] = useState<StrategyVersion | null>(null);
   const [comparison, setComparison] = useState<BacktestComparison | null>(null);
   const [tab, setTab] = useState<"versions" | "compare" | "score">("versions");
-  const [loading, setLoading] = useState(false);
 
   // Compare form
   const [baselineReport, setBaselineReport] = useState("");
@@ -32,7 +31,6 @@ export default function VersionsPage() {
 
   useEffect(() => {
     if (!selectedProject) return;
-    setLoading(true);
     Promise.all([
       versionsApi.list(selectedProject),
       analysisApi.getBacktests(selectedProject),
@@ -43,7 +41,7 @@ export default function VersionsPage() {
       setScores(s.data);
       const baseline = r.data.find((x: BacktestReport) => x.is_baseline);
       if (baseline) setBaselineReport(baseline.id);
-    }).finally(() => setLoading(false));
+    });
   }, [selectedProject]);
 
   const approve = async (vId: string) => {
