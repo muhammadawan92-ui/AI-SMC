@@ -278,6 +278,25 @@ def most_recent_ob(*obs):
     return valid[-1]
 
 
+def select_ob_by_preference(m15_ob, m5_ob):
+    """Pick OB based on SMC_OB_TIMEFRAME_PREFERENCE env.
+
+    Modes:
+      - m15_then_m5 (default): always prefer M15 OB when available.
+        M15 typically gives a wider, structurally stronger zone with more
+        SL buffer than the equivalent M5 OB, which is often inside it.
+      - m5_then_m15: keep tight M5 entry when present, fall back to M15.
+      - most_recent: legacy behaviour, pick whichever OB formed last in time
+        (almost always M5 because M5 candles are newer than M15 by definition).
+    """
+    pref = (os.getenv("SMC_OB_TIMEFRAME_PREFERENCE", "m15_then_m5") or "m15_then_m5").strip().lower()
+    if pref == "most_recent":
+        return most_recent_ob(m15_ob, m5_ob)
+    if pref == "m5_then_m15":
+        return m5_ob if m5_ob else m15_ob
+    return m15_ob if m15_ob else m5_ob
+
+
 def choose_h1_swing_range(h1: pd.DataFrame, h1_result: dict, h1_last_event: dict | None):
     if not h1_last_event:
         tail = h1.tail(120)
@@ -333,10 +352,33 @@ def fib_prices(swing_low: float, swing_high: float, bias: int):
 
 
 def price_location(price: float, swing_low: float, swing_high: float):
-    equilibrium = (swing_high + swing_low) / 2.0
+    """Classify price within the active swing range.
+
+    SMC_LOCATION_MODE controls how strict 'premium' / 'discount' are.
+
+      - strict (default): price is only 'premium' when it has retraced into
+        the upper OTE band (>= SMC_PREMIUM_FIB of the range from the low,
+        default 0.618), and only 'discount' when below SMC_DISCOUNT_FIB
+        (default 0.382). Anything between is 'equilibrium' so retracement
+        trades only fire from real OTE depth, not just past the 50% line.
+      - classic: legacy 50% split with a small neutral band controlled by
+        SMC_EQ_NEUTRAL_BAND (kept for back-compat).
+    """
     rng = swing_high - swing_low
     if rng <= 0:
         return "equilibrium"
+    mode = (os.getenv("SMC_LOCATION_MODE", "strict") or "strict").strip().lower()
+    if mode == "strict":
+        premium_min_fib = float(os.getenv("SMC_PREMIUM_FIB", "0.618"))
+        discount_max_fib = float(os.getenv("SMC_DISCOUNT_FIB", "0.382"))
+        premium_threshold = swing_low + rng * premium_min_fib
+        discount_threshold = swing_low + rng * discount_max_fib
+        if price >= premium_threshold:
+            return "premium"
+        if price <= discount_threshold:
+            return "discount"
+        return "equilibrium"
+    equilibrium = (swing_high + swing_low) / 2.0
     neutral_band = rng * float(os.getenv("SMC_EQ_NEUTRAL_BAND", "0.03"))
     if abs(price - equilibrium) <= neutral_band:
         return "equilibrium"
@@ -408,7 +450,7 @@ def select_active_ob(
             zone_name = "discount_retracement_zone"
     m15_ob = last_valid_ob(m15_result["events"], m15, trade_direction, "M15", zone_low=zone_low, zone_high=zone_high)
     m5_ob = last_valid_ob(m5_result["events"], m5, trade_direction, "M5", zone_low=zone_low, zone_high=zone_high)
-    selected_ob = most_recent_ob(m15_ob, m5_ob)
+    selected_ob = select_ob_by_preference(m15_ob, m5_ob)
     return selected_ob, m15_ob, m5_ob, zone_name
 
 
