@@ -1,0 +1,108 @@
+EA AI Platform - Friend Setup Guide
+===================================
+
+Repository:
+https://github.com/muhammadawan92-ui/AI-SMC
+
+1) Install required software
+----------------------------
+- Git: https://git-scm.com/downloads
+- Python 3.11+ : https://www.python.org/downloads/
+  (On Windows, enable "Add Python to PATH")
+- Node.js 18+ (includes npm): https://nodejs.org/
+
+Optional:
+- MetaTrader 5 (Windows) if using MT5/overlay features.
+
+
+2) Clone the repository
+-----------------------
+Windows (CMD):
+cd %USERPROFILE%\Desktop
+git clone https://github.com/muhammadawan92-ui/AI-SMC.git
+cd AI-SMC
+
+
+3) Create backend environment file (required)
+---------------------------------------------
+The app uses backend/.env (NOT root .env).
+
+Windows:
+copy .env.example backend\.env
+
+Linux/macOS:
+cp .env.example backend/.env
+
+Then open backend/.env and set at least:
+- APP_SECRET_KEY = any long random secret
+- OPENAI_API_KEY or GEMINI_API_KEY (or use MOCK_LLM=true for test mode)
+- FRONTEND_URL=http://localhost:3000
+
+Never commit backend/.env.
+
+
+4) Start backend (Terminal 1)
+-----------------------------
+cd backend
+python -m venv venv
+
+Activate venv:
+- Windows CMD: venv\Scripts\activate.bat
+- Windows PowerShell: venv\Scripts\Activate.ps1
+- Linux/macOS: source venv/bin/activate
+
+Install + run:
+pip install -r requirements.txt
+python -m app.database
+uvicorn app.main:app --reload --port 8000
+
+Keep this terminal open.
+Backend docs: http://localhost:8000/docs
+Health check: http://localhost:8000/health
+
+
+5) Start frontend (Terminal 2)
+------------------------------
+cd frontend
+npm install
+npm run dev
+
+Open:
+http://localhost:3000
+
+
+6) Quick validation
+-------------------
+- Backend health endpoint returns {"status":"ok", ...}
+- Frontend loads and can connect to API
+- If API fails from frontend, check frontend/.env.local:
+  NEXT_PUBLIC_API_URL=http://localhost:8000
+
+
+7) Common fixes
+---------------
+- "python not found":
+  Reinstall Python with PATH enabled, or use py -3.11
+
+- "npm not found":
+  Reinstall Node.js and reopen terminal
+
+- Port 8000 busy:
+  Stop the other app, or run backend on another port and update frontend API URL
+
+- No LLM key yet:
+  Set MOCK_LLM=true in backend/.env to test without paid API calls
+
+
+8) Optional scripts
+-------------------
+From backend folder (with venv active):
+- Backtest help:
+  python backtest_smc_strategy_from_csv.py --help
+
+- Backtest vs forward compare:
+  python compare_backtest_vs_forward.py
+
+
+Done.
+

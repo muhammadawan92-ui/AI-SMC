@@ -76,29 +76,89 @@ def find_displacement_index(df: pd.DataFrame, start_index: int, end_index: int, 
     return int(candidates[-1]) if candidates else end_index
 
 
-def find_order_block(df: pd.DataFrame, start_index: int, end_index: int, bias: int):
-    start_index = max(0, int(start_index))
-    end_index = min(len(df) - 1, int(end_index))
-    if end_index <= start_index:
+def _env_bool_core(name: str, default: bool = False) -> bool:
+    value = os.getenv(name, str(default)).strip().lower()
+    return value in {"1", "true", "yes", "y", "on"}
+
+
+def _env_int_core(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, str(default)))
+    except Exception:
+        return int(default)
+
+
+def _ob_from_cluster(df: pd.DataFrame, cluster_start: int, chosen_idx: int, bias: int, ob_type: str, displacement_index=None, use_body_only: bool = False):
+    cluster_start = int(max(0, cluster_start))
+    chosen_idx = int(min(len(df) - 1, chosen_idx))
+    cluster = df.loc[cluster_start:chosen_idx]
+    if cluster.empty:
         return None
-    displacement_index = find_displacement_index(df, start_index, end_index, bias)
-    ob_lookback = int(os.getenv("SMC_OB_LOOKBACK", "20"))
-    max_cluster = int(os.getenv("SMC_OB_MAX_CLUSTER", "3"))
-    search_start = max(start_index, displacement_index - ob_lookback)
-    search = df.iloc[search_start:displacement_index].copy()
+
+    wick_high = float(cluster["high"].max())
+    wick_low = float(cluster["low"].min())
+
+    if use_body_only:
+        body_high = float(cluster[["open", "close"]].max(axis=1).max())
+        body_low = float(cluster[["open", "close"]].min(axis=1).min())
+        zone_high = body_high
+        zone_low = body_low
+    else:
+        zone_high = wick_high
+        zone_low = wick_low
+
+    return {
+        "type": ob_type,
+        "bias": bias,
+        "index": int(cluster_start),
+        "end_index": int(chosen_idx),
+        "displacement_index": int(displacement_index) if displacement_index is not None else int(chosen_idx),
+        "time": cluster.iloc[0]["time"],
+        "end_time": cluster.iloc[-1]["time"],
+        "high": float(zone_high),
+        "low": float(zone_low),
+        "wick_high": float(wick_high),
+        "wick_low": float(wick_low),
+        "open": float(cluster.iloc[0]["open"]),
+        "close": float(cluster.iloc[-1]["close"]),
+        "cluster_count": int(len(cluster)),
+        "body_only": bool(use_body_only),
+    }
+
+
+def build_order_block_from_anchor(df: pd.DataFrame, anchor_index: int, bias: int, max_cluster: int = 1, lookback: int = 6, use_body_only: bool = False):
+    """
+    Builds a refined OB around a swing/rejection anchor.
+    For bearish/supply context, it searches backward for the last bullish candle near the swing high.
+    For bullish/demand context, it searches backward for the last bearish candle near the swing low.
+    This is used for H1 supply/demand context even when H1 has not printed a full BOS/CHoCH yet.
+    """
+    if df.empty:
+        return None
+
+    anchor_index = int(max(0, min(len(df) - 1, anchor_index)))
+    search_start = max(0, anchor_index - int(lookback))
+    search = df.loc[search_start:anchor_index]
     if search.empty:
         return None
+
     if bias == BULLISH:
         opposite = search[search["close"] < search["open"]]
         ob_type = "demand"
     else:
         opposite = search[search["close"] > search["open"]]
         ob_type = "supply"
+
     if opposite.empty:
-        return None
-    chosen_idx = int(opposite.index[-1])
+        # Fallback: use the anchor candle itself if no clean opposite candle exists.
+        chosen_idx = anchor_index
+    else:
+        chosen_idx = int(opposite.index[-1])
+
     cluster_start = chosen_idx
     cluster_count = 1
+    max_cluster = max(1, int(max_cluster))
+
     while cluster_count < max_cluster:
         previous_idx = cluster_start - 1
         if previous_idx < search_start:
@@ -113,22 +173,75 @@ def find_order_block(df: pd.DataFrame, start_index: int, end_index: int, bias: i
             break
         cluster_start = previous_idx
         cluster_count += 1
-    cluster = df.loc[cluster_start:chosen_idx]
-    if cluster.empty:
+
+    return _ob_from_cluster(
+        df,
+        cluster_start=cluster_start,
+        chosen_idx=chosen_idx,
+        bias=bias,
+        ob_type=ob_type,
+        displacement_index=anchor_index,
+        use_body_only=use_body_only,
+    )
+
+
+def find_order_block(df: pd.DataFrame, start_index: int, end_index: int, bias: int, max_cluster: int | None = None, use_body_only: bool | None = None):
+    start_index = max(0, int(start_index))
+    end_index = min(len(df) - 1, int(end_index))
+    if end_index <= start_index:
         return None
-    return {
-        "type": ob_type,
-        "bias": bias,
-        "index": int(cluster_start),
-        "end_index": int(chosen_idx),
-        "displacement_index": int(displacement_index),
-        "time": cluster.iloc[0]["time"],
-        "end_time": cluster.iloc[-1]["time"],
-        "high": float(cluster["high"].max()),
-        "low": float(cluster["low"].min()),
-        "open": float(cluster.iloc[0]["open"]),
-        "close": float(cluster.iloc[-1]["close"]),
-    }
+
+    displacement_index = find_displacement_index(df, start_index, end_index, bias)
+    ob_lookback = _env_int_core("SMC_OB_LOOKBACK", 20)
+    if max_cluster is None:
+        max_cluster = _env_int_core("SMC_OB_MAX_CLUSTER", 3)
+    if use_body_only is None:
+        use_body_only = _env_bool_core("SMC_OB_USE_BODY_ONLY", False)
+
+    search_start = max(start_index, displacement_index - ob_lookback)
+    search = df.iloc[search_start:displacement_index].copy()
+    if search.empty:
+        return None
+
+    if bias == BULLISH:
+        opposite = search[search["close"] < search["open"]]
+        ob_type = "demand"
+    else:
+        opposite = search[search["close"] > search["open"]]
+        ob_type = "supply"
+
+    if opposite.empty:
+        return None
+
+    chosen_idx = int(opposite.index[-1])
+    cluster_start = chosen_idx
+    cluster_count = 1
+    max_cluster = max(1, int(max_cluster))
+
+    while cluster_count < max_cluster:
+        previous_idx = cluster_start - 1
+        if previous_idx < search_start:
+            break
+        prev = df.loc[previous_idx]
+        is_opposite = (
+            float(prev["close"]) < float(prev["open"])
+            if bias == BULLISH
+            else float(prev["close"]) > float(prev["open"])
+        )
+        if not is_opposite:
+            break
+        cluster_start = previous_idx
+        cluster_count += 1
+
+    return _ob_from_cluster(
+        df,
+        cluster_start=cluster_start,
+        chosen_idx=chosen_idx,
+        bias=bias,
+        ob_type=ob_type,
+        displacement_index=displacement_index,
+        use_body_only=bool(use_body_only),
+    )
 
 
 def detect_structure(df: pd.DataFrame, length: int):
@@ -246,6 +359,88 @@ def ob_overlaps_zone(ob: dict, zone_low: float, zone_high: float) -> bool:
     return not (ob["low"] > high or ob["high"] < low)
 
 
+def find_rejection_order_block(df: pd.DataFrame, structure_result: dict, bias: int, timeframe_label: str = "H1"):
+    """
+    Detects H1 supply/demand from the latest confirmed H1 swing/rejection area.
+    This is intentionally NOT dependent on a full H1 BOS/CHoCH, because H1 supply can reject price
+    before H1 structure flips bearish. It solves the missing H1 SUPPLY OB visual problem.
+    """
+    if df is None or df.empty or not structure_result:
+        return None
+
+    tf = timeframe_label.upper()
+    max_age = _env_int_core(f"SMC_{tf}_OB_MAX_AGE_BARS", _env_int_core("SMC_H1_OB_MAX_AGE_BARS", 240))
+    anchor_lookback = _env_int_core(f"SMC_{tf}_OB_ANCHOR_LOOKBACK", _env_int_core("SMC_H1_OB_ANCHOR_LOOKBACK", 6))
+    max_cluster = _env_int_core(f"SMC_{tf}_OB_MAX_CLUSTER", _env_int_core("SMC_H1_OB_MAX_CLUSTER", 1))
+    use_body_only = _env_bool_core(f"SMC_{tf}_OB_USE_BODY_ONLY", _env_bool_core("SMC_H1_OB_USE_BODY_ONLY", False))
+
+    pivots = structure_result.get("pivot_highs", []) if bias == BEARISH else structure_result.get("pivot_lows", [])
+    latest_index = len(df) - 1
+
+    def _candidate_from_anchor(anchor_index: int, source: str, pivot: dict | None = None):
+        ob = build_order_block_from_anchor(
+            df,
+            anchor_index=anchor_index,
+            bias=bias,
+            max_cluster=max_cluster,
+            lookback=anchor_lookback,
+            use_body_only=use_body_only,
+        )
+        if not ob:
+            return None
+        if is_ob_invalidated(df, ob, use_close=True):
+            return None
+        clean = dict(ob)
+        clean["timeframe"] = timeframe_label
+        clean["source"] = source
+        clean["h1_rejection_ob"] = True
+        if pivot:
+            clean["pivot_time"] = pivot.get("time")
+            clean["pivot_price"] = pivot.get("price")
+            clean["pivot_index"] = pivot.get("index")
+        return clean
+
+    # Primary: latest confirmed pivot high/low.
+    for pivot in reversed(pivots):
+        pivot_index = int(pivot.get("index", 0))
+        if latest_index - pivot_index > max_age:
+            continue
+        candidate = _candidate_from_anchor(pivot_index, f"{timeframe_label.lower()}_rejection_pivot", pivot)
+        if candidate:
+            return candidate
+
+    # Fallback: recent extreme, useful before a pivot is fully confirmed.
+    fallback_bars = _env_int_core(f"SMC_{tf}_OB_RECENT_LOOKBACK", _env_int_core("SMC_H1_OB_RECENT_LOOKBACK", 120))
+    tail = df.tail(max(10, fallback_bars))
+    if tail.empty:
+        return None
+    anchor_index = int(tail["high"].idxmax()) if bias == BEARISH else int(tail["low"].idxmin())
+    return _candidate_from_anchor(anchor_index, f"{timeframe_label.lower()}_recent_extreme", None)
+
+
+
+
+def price_inside_ob(price: float, ob: dict | None) -> bool:
+    if not ob:
+        return False
+    return float(ob["low"]) <= float(price) <= float(ob["high"])
+
+
+def get_h1_context_ob(trade_direction, trade_mode: str, current_price: float, h1_supply_ob: dict | None, h1_demand_ob: dict | None):
+    if str(os.getenv("SMC_H1_OB_REFINEMENT_ENABLED", "true")).strip().lower() not in {"1", "true", "yes", "y", "on"}:
+        return None
+    if trade_mode != "retracement":
+        return None
+    require_inside = str(os.getenv("SMC_H1_OB_REQUIRE_PRICE_INSIDE", "true")).strip().lower() in {"1", "true", "yes", "y", "on"}
+    if trade_direction == BEARISH and h1_supply_ob:
+        if not require_inside or price_inside_ob(current_price, h1_supply_ob):
+            return h1_supply_ob
+    if trade_direction == BULLISH and h1_demand_ob:
+        if not require_inside or price_inside_ob(current_price, h1_demand_ob):
+            return h1_demand_ob
+    return None
+
+
 def last_valid_ob(events, df: pd.DataFrame, bias: int, timeframe_label: str, zone_low=None, zone_high=None):
     for event in reversed(events):
         if event["bias"] != bias:
@@ -276,25 +471,6 @@ def most_recent_ob(*obs):
         return None
     valid.sort(key=lambda x: x["time"])
     return valid[-1]
-
-
-def select_ob_by_preference(m15_ob, m5_ob):
-    """Pick OB based on SMC_OB_TIMEFRAME_PREFERENCE env.
-
-    Modes:
-      - m15_then_m5 (default): always prefer M15 OB when available.
-        M15 typically gives a wider, structurally stronger zone with more
-        SL buffer than the equivalent M5 OB, which is often inside it.
-      - m5_then_m15: keep tight M5 entry when present, fall back to M15.
-      - most_recent: legacy behaviour, pick whichever OB formed last in time
-        (almost always M5 because M5 candles are newer than M15 by definition).
-    """
-    pref = (os.getenv("SMC_OB_TIMEFRAME_PREFERENCE", "m15_then_m5") or "m15_then_m5").strip().lower()
-    if pref == "most_recent":
-        return most_recent_ob(m15_ob, m5_ob)
-    if pref == "m5_then_m15":
-        return m5_ob if m5_ob else m15_ob
-    return m15_ob if m15_ob else m5_ob
 
 
 def choose_h1_swing_range(h1: pd.DataFrame, h1_result: dict, h1_last_event: dict | None):
@@ -352,37 +528,77 @@ def fib_prices(swing_low: float, swing_high: float, bias: int):
 
 
 def price_location(price: float, swing_low: float, swing_high: float):
-    """Classify price within the active swing range.
-
-    SMC_LOCATION_MODE controls how strict 'premium' / 'discount' are.
-
-      - strict (default): price is only 'premium' when it has retraced into
-        the upper OTE band (>= SMC_PREMIUM_FIB of the range from the low,
-        default 0.618), and only 'discount' when below SMC_DISCOUNT_FIB
-        (default 0.382). Anything between is 'equilibrium' so retracement
-        trades only fire from real OTE depth, not just past the 50% line.
-      - classic: legacy 50% split with a small neutral band controlled by
-        SMC_EQ_NEUTRAL_BAND (kept for back-compat).
+    """
+    SMC premium/discount should not be treated as simply above/below 50%.
+    Default interpretation:
+      below 38.2% = discount
+      38.2% to 61.8% = equilibrium / fair value area
+      above 61.8% = premium
     """
     rng = swing_high - swing_low
     if rng <= 0:
         return "equilibrium"
-    mode = (os.getenv("SMC_LOCATION_MODE", "strict") or "strict").strip().lower()
-    if mode == "strict":
-        premium_min_fib = float(os.getenv("SMC_PREMIUM_FIB", "0.618"))
-        discount_max_fib = float(os.getenv("SMC_DISCOUNT_FIB", "0.382"))
-        premium_threshold = swing_low + rng * premium_min_fib
-        discount_threshold = swing_low + rng * discount_max_fib
-        if price >= premium_threshold:
-            return "premium"
-        if price <= discount_threshold:
-            return "discount"
-        return "equilibrium"
-    equilibrium = (swing_high + swing_low) / 2.0
-    neutral_band = rng * float(os.getenv("SMC_EQ_NEUTRAL_BAND", "0.03"))
-    if abs(price - equilibrium) <= neutral_band:
-        return "equilibrium"
-    return "premium" if price > equilibrium else "discount"
+
+    pos = (float(price) - float(swing_low)) / float(rng)
+    premium_start = float(os.getenv("SMC_PD_PREMIUM_START", "0.618"))
+    discount_start = float(os.getenv("SMC_PD_DISCOUNT_START", "0.382"))
+
+    if pos >= premium_start:
+        return "premium"
+    if pos <= discount_start:
+        return "discount"
+    return "equilibrium"
+
+
+def pd_range_detail(price: float, swing_low: float, swing_high: float):
+    rng = swing_high - swing_low
+    if rng <= 0:
+        return {
+            "pd_position": 0.5,
+            "pd_label": "equilibrium",
+            "equilibrium": (swing_high + swing_low) / 2.0,
+            "premium_start_price": None,
+            "discount_start_price": None,
+        }
+
+    pos = (float(price) - float(swing_low)) / float(rng)
+    premium_start = float(os.getenv("SMC_PD_PREMIUM_START", "0.618"))
+    deep_premium = float(os.getenv("SMC_PD_DEEP_PREMIUM", "0.705"))
+    extreme_premium = float(os.getenv("SMC_PD_EXTREME_PREMIUM", "0.886"))
+    discount_start = float(os.getenv("SMC_PD_DISCOUNT_START", "0.382"))
+    deep_discount = float(os.getenv("SMC_PD_DEEP_DISCOUNT", "0.295"))
+    extreme_discount = float(os.getenv("SMC_PD_EXTREME_DISCOUNT", "0.114"))
+
+    if pos >= extreme_premium:
+        label = "extreme_premium"
+    elif pos >= deep_premium:
+        label = "deep_premium"
+    elif pos >= premium_start:
+        label = "true_premium"
+    elif pos > 0.5:
+        label = "above_EQ_not_true_premium"
+    elif pos <= extreme_discount:
+        label = "extreme_discount"
+    elif pos <= deep_discount:
+        label = "deep_discount"
+    elif pos <= discount_start:
+        label = "true_discount"
+    elif pos < 0.5:
+        label = "below_EQ_not_true_discount"
+    else:
+        label = "equilibrium"
+
+    return {
+        "pd_position": float(pos),
+        "pd_label": label,
+        "equilibrium": float((swing_high + swing_low) / 2.0),
+        "premium_start_price": float(swing_low + rng * premium_start),
+        "deep_premium_price": float(swing_low + rng * deep_premium),
+        "extreme_premium_price": float(swing_low + rng * extreme_premium),
+        "discount_start_price": float(swing_low + rng * discount_start),
+        "deep_discount_price": float(swing_low + rng * deep_discount),
+        "extreme_discount_price": float(swing_low + rng * extreme_discount),
+    }
 
 
 def decide_trade_context(external_bias: int, current_location: str, internal_event_pack, swing_low, swing_high):
@@ -429,13 +645,29 @@ def select_active_ob(
     swing_high,
     equilibrium,
     fibs,
+    h1_supply_ob=None,
+    h1_demand_ob=None,
+    current_price=None,
 ):
     if trade_direction is None:
         return None, None, None, None
     poi_top = max(fibs[0.618], fibs[0.886])
     poi_bottom = min(fibs[0.618], fibs[0.886])
+
+    h1_context_ob = get_h1_context_ob(
+        trade_direction,
+        trade_mode,
+        float(current_price) if current_price is not None else float(equilibrium),
+        h1_supply_ob,
+        h1_demand_ob,
+    )
+
     zone_name = "none"
-    if trade_mode == "continuation":
+    if h1_context_ob:
+        zone_low = float(h1_context_ob["low"])
+        zone_high = float(h1_context_ob["high"])
+        zone_name = "h1_supply_refinement_zone" if trade_direction == BEARISH else "h1_demand_refinement_zone"
+    elif trade_mode == "continuation":
         zone_low = poi_bottom
         zone_high = poi_top
         zone_name = "external_fib_poi"
@@ -448,9 +680,21 @@ def select_active_ob(
             zone_low = swing_low
             zone_high = equilibrium
             zone_name = "discount_retracement_zone"
+
     m15_ob = last_valid_ob(m15_result["events"], m15, trade_direction, "M15", zone_low=zone_low, zone_high=zone_high)
     m5_ob = last_valid_ob(m5_result["events"], m5, trade_direction, "M5", zone_low=zone_low, zone_high=zone_high)
-    selected_ob = select_ob_by_preference(m15_ob, m5_ob)
+
+    if h1_context_ob and str(os.getenv("SMC_H1_OB_M15_FIRST", "true")).strip().lower() in {"1", "true", "yes", "y", "on"}:
+        selected_ob = m15_ob if m15_ob else m5_ob
+    else:
+        selected_ob = most_recent_ob(m15_ob, m5_ob)
+
+    if selected_ob and h1_context_ob:
+        selected_ob = dict(selected_ob)
+        selected_ob["h1_context_ob"] = h1_context_ob
+        selected_ob["inside_h1_ob"] = True
+        selected_ob["h1_refinement_priority"] = "M15_FIRST"
+
     return selected_ob, m15_ob, m5_ob, zone_name
 
 

@@ -14,7 +14,9 @@ python monitor_ai_trades.py --loop 30
 """
 
 import argparse
+import json
 import os
+import shutil
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -29,6 +31,138 @@ from trade_journal import get_active_journal_rows, update_trade_status, init_db
 BACKEND_DIR = Path(__file__).resolve().parent
 load_dotenv(BACKEND_DIR / ".env")
 
+
+
+
+def env_bool(name: str, default: bool = False) -> bool:
+    value = os.getenv(name, str(default)).strip().lower()
+    return value in ["1", "true", "yes", "y", "on"]
+
+
+def json_safe(value):
+    if value is None:
+        return None
+    if hasattr(value, "_asdict"):
+        return {str(k): json_safe(v) for k, v in value._asdict().items()}
+    if hasattr(value, "keys") and not isinstance(value, dict):
+        try:
+            return {str(k): json_safe(value[k]) for k in value.keys()}
+        except Exception:
+            pass
+    if isinstance(value, dict):
+        return {str(k): json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [json_safe(v) for v in value]
+    if isinstance(value, Path):
+        return str(value)
+    if hasattr(value, "isoformat"):
+        try:
+            return value.isoformat()
+        except Exception:
+            pass
+    try:
+        json.dumps(value)
+        return value
+    except Exception:
+        return str(value)
+
+
+def get_visual_journal_dir() -> Path:
+    raw = os.getenv("AI_VISUAL_JOURNAL_DIR", "storage/visual_journal").strip()
+    path = Path(raw)
+    if not path.is_absolute():
+        path = BACKEND_DIR / path
+    return path
+
+
+def get_overlay_csv_path() -> Path | None:
+    raw = os.getenv("AI_OVERLAY_CSV_PATH", "").strip()
+    if raw:
+        return Path(raw)
+    appdata = os.getenv("APPDATA", "").strip()
+    if appdata:
+        return Path(appdata) / "MetaQuotes" / "Terminal" / "Common" / "Files" / "AI_SMC_OVERLAY.csv"
+    return None
+
+
+def visual_stage_enabled(stage: str) -> bool:
+    if not env_bool("AI_VISUAL_JOURNAL_ENABLED", False):
+        return False
+    stage = stage.lower()
+    if stage == "fill":
+        return env_bool("AI_VISUAL_CAPTURE_ON_FILL", True)
+    if stage == "close":
+        return env_bool("AI_VISUAL_CAPTURE_ON_CLOSE", True)
+    if stage == "pending":
+        return env_bool("AI_VISUAL_CAPTURE_ON_PENDING", False)
+    return True
+
+
+def capture_screen_png(path: Path) -> str | None:
+    if not env_bool("AI_VISUAL_SCREENSHOT_ENABLED", True):
+        return None
+    try:
+        import pyautogui  # optional dependency
+        img = pyautogui.screenshot()
+        img.save(str(path))
+        return str(path)
+    except Exception as exc:
+        return f"SCREENSHOT_FAILED: {exc}"
+
+
+def save_visual_journal_snapshot(stage: str, *, row=None, position=None, deals=None, orders=None, reason: str = ""):
+    """
+    Save fill/close visual journal snapshots without changing DB schema.
+    Uses one file per journal_id+stage so monitor loop will not spam duplicates.
+    """
+    try:
+        if not visual_stage_enabled(stage):
+            return None
+
+        row_dict = json_safe(row) or {}
+        journal_id = int(row_dict.get("id") or 0)
+        symbol = str(row_dict.get("symbol") or os.getenv("TRADING_SYMBOL", "SYMBOL"))
+        day = datetime.now().strftime("%Y-%m-%d")
+        base_dir = get_visual_journal_dir() / day
+        base_dir.mkdir(parents=True, exist_ok=True)
+        stage_safe = "".join(c if c.isalnum() or c in "_-" else "_" for c in stage)
+        base = f"J{journal_id}_{symbol}_{stage_safe}"
+
+        json_path = base_dir / f"{base}.json"
+        if json_path.exists():
+            return str(json_path)
+
+        png_path = base_dir / f"{base}.png"
+        screenshot_status = capture_screen_png(png_path)
+        screenshot_path = str(png_path) if screenshot_status == str(png_path) else None
+
+        overlay_copy_path = None
+        overlay_src = get_overlay_csv_path()
+        if overlay_src and overlay_src.exists():
+            overlay_dst = base_dir / f"{base}_overlay.csv"
+            shutil.copy2(str(overlay_src), str(overlay_dst))
+            overlay_copy_path = str(overlay_dst)
+
+        payload = {
+            "created_at": datetime.now().isoformat(timespec="seconds"),
+            "stage": stage,
+            "journal_id": journal_id,
+            "reason": reason,
+            "symbol": symbol,
+            "screenshot_path": screenshot_path,
+            "screenshot_status": screenshot_status,
+            "overlay_csv_copy": overlay_copy_path,
+            "journal_row": row_dict,
+            "position": json_safe(position),
+            "deals": json_safe(deals or []),
+            "orders": json_safe(orders or []),
+        }
+        json_path.write_text(json.dumps(json_safe(payload), ensure_ascii=False, indent=2), encoding="utf-8")
+        print(f"Visual journal saved: {json_path}")
+        return str(json_path)
+    except Exception as exc:
+        print(f"WARNING: Visual journal capture failed at stage={stage}: {exc}")
+        return None
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -177,6 +311,12 @@ def update_one_row(row, active_orders):
             status="PENDING_ACTIVE",
             reason="Pending order is active in MT5.",
         )
+        save_visual_journal_snapshot(
+            "pending",
+            row=row,
+            orders=[order],
+            reason="Pending order is active in MT5.",
+        )
         print(f"Journal {journal_id}: pending active, order ticket {order.ticket}")
         return
 
@@ -205,6 +345,12 @@ def update_one_row(row, active_orders):
             last_unrealized_r=unrealized_r,
             profit=float(position.profit),
         )
+        save_visual_journal_snapshot(
+            "fill",
+            row=row,
+            position=position,
+            reason="Position is open in MT5.",
+        )
         print(
             f"Journal {journal_id}: filled/open, "
             f"position {position.ticket}, R={unrealized_r:.2f}, profit={position.profit:.2f}"
@@ -231,6 +377,13 @@ def update_one_row(row, active_orders):
                 closed_at=utc_now(),
                 close_price=float(last_deal.price),
                 profit=total_profit,
+            )
+            save_visual_journal_snapshot(
+                "close",
+                row=row,
+                deals=matched_deals,
+                orders=matched_orders,
+                reason=f"{status}: Closed deal found in MT5 history. Profit={total_profit:.2f}",
             )
             print(f"Journal {journal_id}: {status}, profit={total_profit:.2f}")
             return

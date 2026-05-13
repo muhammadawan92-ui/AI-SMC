@@ -179,28 +179,130 @@ def find_displacement_index(df: pd.DataFrame, start_index: int, end_index: int, 
     return end_index
 
 
-def find_order_block(df: pd.DataFrame, start_index: int, end_index: int, bias: int):
-    """
-    Bullish demand OB:
-    last bearish candle / bearish cluster before bullish displacement.
+def _env_bool_core(name: str, default: bool = False) -> bool:
+    value = os.getenv(name, str(default)).strip().lower()
+    return value in {"1", "true", "yes", "y", "on"}
 
-    Bearish supply OB:
-    last bullish candle / bullish cluster before bearish displacement.
+
+def _env_int_core(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, str(default)))
+    except Exception:
+        return int(default)
+
+
+def _ob_from_cluster(df: pd.DataFrame, cluster_start: int, chosen_idx: int, bias: int, ob_type: str, displacement_index=None, use_body_only: bool = False):
+    cluster_start = int(max(0, cluster_start))
+    chosen_idx = int(min(len(df) - 1, chosen_idx))
+    cluster = df.loc[cluster_start:chosen_idx]
+    if cluster.empty:
+        return None
+
+    wick_high = float(cluster["high"].max())
+    wick_low = float(cluster["low"].min())
+
+    if use_body_only:
+        body_high = float(cluster[["open", "close"]].max(axis=1).max())
+        body_low = float(cluster[["open", "close"]].min(axis=1).min())
+        zone_high = body_high
+        zone_low = body_low
+    else:
+        zone_high = wick_high
+        zone_low = wick_low
+
+    return {
+        "type": ob_type,
+        "bias": bias,
+        "index": int(cluster_start),
+        "end_index": int(chosen_idx),
+        "displacement_index": int(displacement_index) if displacement_index is not None else int(chosen_idx),
+        "time": cluster.iloc[0]["time"],
+        "end_time": cluster.iloc[-1]["time"],
+        "high": float(zone_high),
+        "low": float(zone_low),
+        "wick_high": float(wick_high),
+        "wick_low": float(wick_low),
+        "open": float(cluster.iloc[0]["open"]),
+        "close": float(cluster.iloc[-1]["close"]),
+        "cluster_count": int(len(cluster)),
+        "body_only": bool(use_body_only),
+    }
+
+
+def build_order_block_from_anchor(df: pd.DataFrame, anchor_index: int, bias: int, max_cluster: int = 1, lookback: int = 6, use_body_only: bool = False):
     """
+    Builds a refined OB around a swing/rejection anchor.
+    For bearish/supply context, it searches backward for the last bullish candle near the swing high.
+    For bullish/demand context, it searches backward for the last bearish candle near the swing low.
+    This is used for H1 supply/demand context even when H1 has not printed a full BOS/CHoCH yet.
+    """
+    if df.empty:
+        return None
+
+    anchor_index = int(max(0, min(len(df) - 1, anchor_index)))
+    search_start = max(0, anchor_index - int(lookback))
+    search = df.loc[search_start:anchor_index]
+    if search.empty:
+        return None
+
+    if bias == BULLISH:
+        opposite = search[search["close"] < search["open"]]
+        ob_type = "demand"
+    else:
+        opposite = search[search["close"] > search["open"]]
+        ob_type = "supply"
+
+    if opposite.empty:
+        # Fallback: use the anchor candle itself if no clean opposite candle exists.
+        chosen_idx = anchor_index
+    else:
+        chosen_idx = int(opposite.index[-1])
+
+    cluster_start = chosen_idx
+    cluster_count = 1
+    max_cluster = max(1, int(max_cluster))
+
+    while cluster_count < max_cluster:
+        previous_idx = cluster_start - 1
+        if previous_idx < search_start:
+            break
+        prev = df.loc[previous_idx]
+        is_opposite = (
+            float(prev["close"]) < float(prev["open"])
+            if bias == BULLISH
+            else float(prev["close"]) > float(prev["open"])
+        )
+        if not is_opposite:
+            break
+        cluster_start = previous_idx
+        cluster_count += 1
+
+    return _ob_from_cluster(
+        df,
+        cluster_start=cluster_start,
+        chosen_idx=chosen_idx,
+        bias=bias,
+        ob_type=ob_type,
+        displacement_index=anchor_index,
+        use_body_only=use_body_only,
+    )
+
+
+def find_order_block(df: pd.DataFrame, start_index: int, end_index: int, bias: int, max_cluster: int | None = None, use_body_only: bool | None = None):
     start_index = max(0, int(start_index))
     end_index = min(len(df) - 1, int(end_index))
-
     if end_index <= start_index:
         return None
 
     displacement_index = find_displacement_index(df, start_index, end_index, bias)
-
-    ob_lookback = int(os.getenv("SMC_OB_LOOKBACK", "20"))
-    max_cluster = int(os.getenv("SMC_OB_MAX_CLUSTER", "3"))
+    ob_lookback = _env_int_core("SMC_OB_LOOKBACK", 20)
+    if max_cluster is None:
+        max_cluster = _env_int_core("SMC_OB_MAX_CLUSTER", 3)
+    if use_body_only is None:
+        use_body_only = _env_bool_core("SMC_OB_USE_BODY_ONLY", False)
 
     search_start = max(start_index, displacement_index - ob_lookback)
     search = df.iloc[search_start:displacement_index].copy()
-
     if search.empty:
         return None
 
@@ -215,47 +317,34 @@ def find_order_block(df: pd.DataFrame, start_index: int, end_index: int, bias: i
         return None
 
     chosen_idx = int(opposite.index[-1])
-
     cluster_start = chosen_idx
     cluster_count = 1
+    max_cluster = max(1, int(max_cluster))
 
     while cluster_count < max_cluster:
         previous_idx = cluster_start - 1
-
         if previous_idx < search_start:
             break
-
         prev = df.loc[previous_idx]
-
-        if bias == BULLISH:
-            is_opposite = float(prev["close"]) < float(prev["open"])
-        else:
-            is_opposite = float(prev["close"]) > float(prev["open"])
-
+        is_opposite = (
+            float(prev["close"]) < float(prev["open"])
+            if bias == BULLISH
+            else float(prev["close"]) > float(prev["open"])
+        )
         if not is_opposite:
             break
-
         cluster_start = previous_idx
         cluster_count += 1
 
-    cluster = df.loc[cluster_start:chosen_idx]
-
-    if cluster.empty:
-        return None
-
-    return {
-        "type": ob_type,
-        "bias": bias,
-        "index": int(cluster_start),
-        "end_index": int(chosen_idx),
-        "displacement_index": int(displacement_index),
-        "time": cluster.iloc[0]["time"],
-        "end_time": cluster.iloc[-1]["time"],
-        "high": float(cluster["high"].max()),
-        "low": float(cluster["low"].min()),
-        "open": float(cluster.iloc[0]["open"]),
-        "close": float(cluster.iloc[-1]["close"]),
-    }
+    return _ob_from_cluster(
+        df,
+        cluster_start=cluster_start,
+        chosen_idx=chosen_idx,
+        bias=bias,
+        ob_type=ob_type,
+        displacement_index=displacement_index,
+        use_body_only=bool(use_body_only),
+    )
 
 
 def detect_structure(df: pd.DataFrame, length: int):
@@ -418,6 +507,66 @@ def ob_overlaps_zone(ob: dict, zone_low: float, zone_high: float) -> bool:
     return not (ob["low"] > high or ob["high"] < low)
 
 
+def find_rejection_order_block(df: pd.DataFrame, structure_result: dict, bias: int, timeframe_label: str = "H1"):
+    """
+    Detects H1 supply/demand from the latest confirmed H1 swing/rejection area.
+    This is intentionally NOT dependent on a full H1 BOS/CHoCH, because H1 supply can reject price
+    before H1 structure flips bearish. It solves the missing H1 SUPPLY OB visual problem.
+    """
+    if df is None or df.empty or not structure_result:
+        return None
+
+    tf = timeframe_label.upper()
+    max_age = _env_int_core(f"SMC_{tf}_OB_MAX_AGE_BARS", _env_int_core("SMC_H1_OB_MAX_AGE_BARS", 240))
+    anchor_lookback = _env_int_core(f"SMC_{tf}_OB_ANCHOR_LOOKBACK", _env_int_core("SMC_H1_OB_ANCHOR_LOOKBACK", 6))
+    max_cluster = _env_int_core(f"SMC_{tf}_OB_MAX_CLUSTER", _env_int_core("SMC_H1_OB_MAX_CLUSTER", 1))
+    use_body_only = _env_bool_core(f"SMC_{tf}_OB_USE_BODY_ONLY", _env_bool_core("SMC_H1_OB_USE_BODY_ONLY", False))
+
+    pivots = structure_result.get("pivot_highs", []) if bias == BEARISH else structure_result.get("pivot_lows", [])
+    latest_index = len(df) - 1
+
+    def _candidate_from_anchor(anchor_index: int, source: str, pivot: dict | None = None):
+        ob = build_order_block_from_anchor(
+            df,
+            anchor_index=anchor_index,
+            bias=bias,
+            max_cluster=max_cluster,
+            lookback=anchor_lookback,
+            use_body_only=use_body_only,
+        )
+        if not ob:
+            return None
+        if is_ob_invalidated(df, ob, use_close=True):
+            return None
+        clean = dict(ob)
+        clean["timeframe"] = timeframe_label
+        clean["source"] = source
+        clean["h1_rejection_ob"] = True
+        if pivot:
+            clean["pivot_time"] = pivot.get("time")
+            clean["pivot_price"] = pivot.get("price")
+            clean["pivot_index"] = pivot.get("index")
+        return clean
+
+    # Primary: latest confirmed pivot high/low.
+    for pivot in reversed(pivots):
+        pivot_index = int(pivot.get("index", 0))
+        if latest_index - pivot_index > max_age:
+            continue
+        candidate = _candidate_from_anchor(pivot_index, f"{timeframe_label.lower()}_rejection_pivot", pivot)
+        if candidate:
+            return candidate
+
+    # Fallback: recent extreme, useful before a pivot is fully confirmed.
+    fallback_bars = _env_int_core(f"SMC_{tf}_OB_RECENT_LOOKBACK", _env_int_core("SMC_H1_OB_RECENT_LOOKBACK", 120))
+    tail = df.tail(max(10, fallback_bars))
+    if tail.empty:
+        return None
+    anchor_index = int(tail["high"].idxmax()) if bias == BEARISH else int(tail["low"].idxmin())
+    return _candidate_from_anchor(anchor_index, f"{timeframe_label.lower()}_recent_extreme", None)
+
+
+
 def last_valid_ob(events, df: pd.DataFrame, bias: int, timeframe_label: str, zone_low=None, zone_high=None):
     for event in reversed(events):
         if event["bias"] != bias:
@@ -456,21 +605,97 @@ def most_recent_ob(*obs):
     return valid[-1]
 
 
-def select_ob_by_preference(m15_ob, m5_ob):
-    """Pick OB based on SMC_OB_TIMEFRAME_PREFERENCE env.
 
-    Modes:
-      - m15_then_m5 (default): always prefer M15 OB when available.
-      - m5_then_m15: tight M5 entry first, fall back to M15.
-      - most_recent: legacy behaviour, picks whichever OB formed last
-        (almost always M5 because M5 candles are newer than M15).
+def price_inside_ob(price: float, ob: dict | None) -> bool:
+    if not ob:
+        return False
+    return float(ob["low"]) <= float(price) <= float(ob["high"])
+
+
+def get_h1_context_ob(trade_direction, trade_mode: str, current_price: float, h1_supply_ob: dict | None, h1_demand_ob: dict | None):
     """
-    pref = (os.getenv("SMC_OB_TIMEFRAME_PREFERENCE", "m15_then_m5") or "m15_then_m5").strip().lower()
-    if pref == "most_recent":
-        return most_recent_ob(m15_ob, m5_ob)
-    if pref == "m5_then_m15":
-        return m5_ob if m5_ob else m15_ob
-    return m15_ob if m15_ob else m5_ob
+    H1 OB context has priority over simple premium/discount for retracement refinement.
+    Sell retracement: only H1 supply is relevant.
+    Buy retracement: only H1 demand is relevant.
+    """
+    if not env_bool("SMC_H1_OB_REFINEMENT_ENABLED", True):
+        return None
+
+    if trade_mode != "retracement":
+        return None
+
+    require_price_inside = env_bool("SMC_H1_OB_REQUIRE_PRICE_INSIDE", True)
+
+    if trade_direction == BEARISH and h1_supply_ob:
+        if not require_price_inside or price_inside_ob(current_price, h1_supply_ob):
+            return h1_supply_ob
+
+    if trade_direction == BULLISH and h1_demand_ob:
+        if not require_price_inside or price_inside_ob(current_price, h1_demand_ob):
+            return h1_demand_ob
+
+    return None
+
+
+def apply_h1_retrace_stop_for_visuals(trade_direction, trade_mode: str, entry: float, normal_stop: float, selected_ob: dict | None, rr: float, buffer_price: float = 0.0):
+    """
+    Visual SL/TP preview only. demo_trade_executor.py has the execution copy.
+    Inside H1 OB, SL can be protected by H1 50% or H1 extreme.
+    Outside H1 OB, normal LTF OB SL stays unchanged.
+    """
+    if not selected_ob or not env_bool("SMC_H1_OB_RETRACE_SL_ENABLED", True):
+        risk = (entry - normal_stop) if trade_direction == BULLISH else (normal_stop - entry)
+        tp = entry + risk * rr if trade_direction == BULLISH else entry - risk * rr
+        return normal_stop, tp, "ltf_ob"
+
+    if trade_mode != "retracement":
+        risk = (entry - normal_stop) if trade_direction == BULLISH else (normal_stop - entry)
+        tp = entry + risk * rr if trade_direction == BULLISH else entry - risk * rr
+        return normal_stop, tp, "ltf_ob"
+
+    h1_ob = selected_ob.get("h1_context_ob")
+    if not h1_ob:
+        risk = (entry - normal_stop) if trade_direction == BULLISH else (normal_stop - entry)
+        tp = entry + risk * rr if trade_direction == BULLISH else entry - risk * rr
+        return normal_stop, tp, "ltf_ob"
+
+    mode = os.getenv("SMC_H1_OB_RETRACE_SL_MODE", "midpoint").strip().lower()
+    if mode not in {"auto", "midpoint", "extreme", "off"}:
+        mode = "midpoint"
+    if mode == "off":
+        risk = (entry - normal_stop) if trade_direction == BULLISH else (normal_stop - entry)
+        tp = entry + risk * rr if trade_direction == BULLISH else entry - risk * rr
+        return normal_stop, tp, "ltf_ob"
+
+    h1_high = float(h1_ob["high"])
+    h1_low = float(h1_ob["low"])
+    h1_mid = (h1_high + h1_low) / 2.0
+
+    if trade_direction == BEARISH:
+        if mode == "extreme":
+            stop = h1_high + buffer_price
+            source = "h1_supply_extreme"
+        else:
+            stop = max(float(normal_stop), h1_mid)
+            source = "h1_supply_midpoint_protected"
+        risk = stop - entry
+        tp = entry - risk * rr
+        return stop, tp, source
+
+    if trade_direction == BULLISH:
+        if mode == "extreme":
+            stop = h1_low - buffer_price
+            source = "h1_demand_extreme"
+        else:
+            stop = min(float(normal_stop), h1_mid)
+            source = "h1_demand_midpoint_protected"
+        risk = entry - stop
+        tp = entry + risk * rr
+        return stop, tp, source
+
+    risk = abs(entry - normal_stop)
+    tp = entry
+    return normal_stop, tp, "ltf_ob"
 
 
 def add_rect(lines, name, time1, time2, top, bottom, text, color):
@@ -574,48 +799,77 @@ def fib_prices(swing_low: float, swing_high: float, bias: int):
 
 
 def price_location(price: float, swing_low: float, swing_high: float):
-    """Classify price within the active swing range.
-
-    SMC_LOCATION_MODE controls how strict 'premium' / 'discount' are.
-
-      - strict (default): only the deep ends count.
-        premium  = price >= swing_low + SMC_PREMIUM_FIB * range  (default 0.618)
-        discount = price <= swing_low + SMC_DISCOUNT_FIB * range (default 0.382)
-        anything between is 'equilibrium', so retracement trades only fire
-        from real OTE depth, not just past the 50% line.
-      - classic: legacy 50% split with SMC_EQ_NEUTRAL_BAND neutral zone.
+    """
+    SMC premium/discount should not be treated as simply above/below 50%.
+    Default interpretation:
+      below 38.2% = discount
+      38.2% to 61.8% = equilibrium / fair value area
+      above 61.8% = premium
     """
     rng = swing_high - swing_low
-
     if rng <= 0:
         return "equilibrium"
 
-    mode = (os.getenv("SMC_LOCATION_MODE", "strict") or "strict").strip().lower()
+    pos = (float(price) - float(swing_low)) / float(rng)
+    premium_start = float(os.getenv("SMC_PD_PREMIUM_START", "0.618"))
+    discount_start = float(os.getenv("SMC_PD_DISCOUNT_START", "0.382"))
 
-    if mode == "strict":
-        premium_min_fib = float(os.getenv("SMC_PREMIUM_FIB", "0.618"))
-        discount_max_fib = float(os.getenv("SMC_DISCOUNT_FIB", "0.382"))
-        premium_threshold = swing_low + rng * premium_min_fib
-        discount_threshold = swing_low + rng * discount_max_fib
-
-        if price >= premium_threshold:
-            return "premium"
-
-        if price <= discount_threshold:
-            return "discount"
-
-        return "equilibrium"
-
-    equilibrium = (swing_high + swing_low) / 2.0
-    neutral_band = rng * float(os.getenv("SMC_EQ_NEUTRAL_BAND", "0.03"))
-
-    if abs(price - equilibrium) <= neutral_band:
-        return "equilibrium"
-
-    if price > equilibrium:
+    if pos >= premium_start:
         return "premium"
+    if pos <= discount_start:
+        return "discount"
+    return "equilibrium"
 
-    return "discount"
+
+def pd_range_detail(price: float, swing_low: float, swing_high: float):
+    rng = swing_high - swing_low
+    if rng <= 0:
+        return {
+            "pd_position": 0.5,
+            "pd_label": "equilibrium",
+            "equilibrium": (swing_high + swing_low) / 2.0,
+            "premium_start_price": None,
+            "discount_start_price": None,
+        }
+
+    pos = (float(price) - float(swing_low)) / float(rng)
+    premium_start = float(os.getenv("SMC_PD_PREMIUM_START", "0.618"))
+    deep_premium = float(os.getenv("SMC_PD_DEEP_PREMIUM", "0.705"))
+    extreme_premium = float(os.getenv("SMC_PD_EXTREME_PREMIUM", "0.886"))
+    discount_start = float(os.getenv("SMC_PD_DISCOUNT_START", "0.382"))
+    deep_discount = float(os.getenv("SMC_PD_DEEP_DISCOUNT", "0.295"))
+    extreme_discount = float(os.getenv("SMC_PD_EXTREME_DISCOUNT", "0.114"))
+
+    if pos >= extreme_premium:
+        label = "extreme_premium"
+    elif pos >= deep_premium:
+        label = "deep_premium"
+    elif pos >= premium_start:
+        label = "true_premium"
+    elif pos > 0.5:
+        label = "above_EQ_not_true_premium"
+    elif pos <= extreme_discount:
+        label = "extreme_discount"
+    elif pos <= deep_discount:
+        label = "deep_discount"
+    elif pos <= discount_start:
+        label = "true_discount"
+    elif pos < 0.5:
+        label = "below_EQ_not_true_discount"
+    else:
+        label = "equilibrium"
+
+    return {
+        "pd_position": float(pos),
+        "pd_label": label,
+        "equilibrium": float((swing_high + swing_low) / 2.0),
+        "premium_start_price": float(swing_low + rng * premium_start),
+        "deep_premium_price": float(swing_low + rng * deep_premium),
+        "extreme_premium_price": float(swing_low + rng * extreme_premium),
+        "discount_start_price": float(swing_low + rng * discount_start),
+        "deep_discount_price": float(swing_low + rng * deep_discount),
+        "extreme_discount_price": float(swing_low + rng * extreme_discount),
+    }
 
 
 def decide_trade_context(external_bias: int, current_location: str, internal_event_pack, swing_low, swing_high):
@@ -665,6 +919,236 @@ def decide_trade_context(external_bias: int, current_location: str, internal_eve
     return "NO_TRADE", None, "none"
 
 
+
+
+# ---------------------------------------------------------------------------
+# FIB-CONFIRMED LTF OB SELECTION
+# ---------------------------------------------------------------------------
+# Manual rule implemented here:
+#   1) Price reacts from a valid H1 supply/demand context.
+#   2) M15/M5 prints the confirming CHoCH/BOS.
+#   3) Draw fib on that confirming LTF impulse.
+#   4) For sells, confirm supply OB only when the opposite bullish candle sits
+#      inside the impulse premium retracement band (default 0.618-0.886).
+#   5) For buys, confirm demand OB only when the opposite bearish candle sits
+#      inside the impulse discount retracement band (default 0.618-0.886).
+# This prevents the EA from choosing a low-quality lower OB just because it is
+# the most recent candle before displacement.
+
+def _env_float_core(name: str, default: float) -> float:
+    try:
+        return float(os.getenv(name, str(default)))
+    except Exception:
+        return float(default)
+
+
+def _candle_body_bounds(row):
+    return min(float(row["open"]), float(row["close"])), max(float(row["open"]), float(row["close"]))
+
+
+def _price_ranges_overlap(low_a: float, high_a: float, low_b: float, high_b: float) -> bool:
+    a_low, a_high = min(low_a, high_a), max(low_a, high_a)
+    b_low, b_high = min(low_b, high_b), max(low_b, high_b)
+    return not (a_high < b_low or a_low > b_high)
+
+
+def build_fib_confirmed_ob_from_event(
+    df: pd.DataFrame,
+    event: dict,
+    bias: int,
+    timeframe_label: str,
+    zone_low=None,
+    zone_high=None,
+):
+    """
+    Builds the OB the same way the user manually validates it with fib:
+    - bearish setup: fib from LTF impulse high to impulse low, then choose bullish candle(s)
+      in the 0.618-0.886 premium retracement band as supply.
+    - bullish setup: fib from LTF impulse low to impulse high, then choose bearish candle(s)
+      in the 0.618-0.886 discount retracement band as demand.
+    """
+    if df is None or df.empty or not event:
+        return None
+
+    try:
+        break_index = int(event.get("break_index"))
+        level_index = int(event.get("level_index", break_index))
+    except Exception:
+        return None
+
+    if break_index <= 1 or break_index >= len(df):
+        return None
+
+    pre_event_lookback = _env_int_core("SMC_FIB_OB_PRE_EVENT_LOOKBACK", 12)
+    start = max(0, min(level_index, break_index) - pre_event_lookback)
+    end = min(len(df) - 1, break_index)
+    segment = df.loc[start:end]
+    if segment.empty or len(segment) < 3:
+        return None
+
+    fib_min = _env_float_core("SMC_FIB_OB_LEVEL_MIN", 0.618)
+    fib_max = _env_float_core("SMC_FIB_OB_LEVEL_MAX", 0.886)
+    fib_min, fib_max = min(fib_min, fib_max), max(fib_min, fib_max)
+    fib_min = max(0.0, min(1.0, fib_min))
+    fib_max = max(0.0, min(1.0, fib_max))
+
+    use_body_overlap = _env_bool_core("SMC_FIB_OB_USE_BODY_OVERLAP", False)
+    max_cluster = _env_int_core("SMC_FIB_OB_MAX_CLUSTER", _env_int_core("SMC_OB_MAX_CLUSTER", 1))
+    use_body_only = _env_bool_core("SMC_FIB_OB_USE_BODY_ONLY", _env_bool_core("SMC_OB_USE_BODY_ONLY", False))
+    selection_mode = os.getenv("SMC_FIB_OB_SELECTION", "closest_to_extreme").strip().lower()
+
+    if bias == BEARISH:
+        # Sell impulse: source high -> displacement/structure-break low.
+        impulse_high_idx = int(segment["high"].idxmax())
+        impulse_tail = df.loc[impulse_high_idx:end]
+        if impulse_tail.empty:
+            return None
+        impulse_low_idx = int(impulse_tail["low"].idxmin())
+        impulse_high = float(df.loc[impulse_high_idx]["high"])
+        impulse_low = float(df.loc[impulse_low_idx]["low"])
+        if impulse_high <= impulse_low or impulse_low_idx <= impulse_high_idx:
+            return None
+
+        rng = impulse_high - impulse_low
+        fib_zone_low = impulse_low + rng * fib_min
+        fib_zone_high = impulse_low + rng * fib_max
+        search = df.loc[impulse_high_idx:impulse_low_idx]
+        opposite_mask = search["close"] > search["open"]
+        ob_type = "supply"
+    else:
+        # Buy impulse: source low -> displacement/structure-break high.
+        impulse_low_idx = int(segment["low"].idxmin())
+        impulse_tail = df.loc[impulse_low_idx:end]
+        if impulse_tail.empty:
+            return None
+        impulse_high_idx = int(impulse_tail["high"].idxmax())
+        impulse_low = float(df.loc[impulse_low_idx]["low"])
+        impulse_high = float(df.loc[impulse_high_idx]["high"])
+        if impulse_high <= impulse_low or impulse_high_idx <= impulse_low_idx:
+            return None
+
+        rng = impulse_high - impulse_low
+        fib_zone_low = impulse_high - rng * fib_max
+        fib_zone_high = impulse_high - rng * fib_min
+        search = df.loc[impulse_low_idx:impulse_high_idx]
+        opposite_mask = search["close"] < search["open"]
+        ob_type = "demand"
+
+    if search.empty:
+        return None
+
+    candidates = []
+    for idx, row in search[opposite_mask].iterrows():
+        wick_low = float(row["low"])
+        wick_high = float(row["high"])
+        body_low, body_high = _candle_body_bounds(row)
+        check_low, check_high = (body_low, body_high) if use_body_overlap else (wick_low, wick_high)
+
+        if not _price_ranges_overlap(check_low, check_high, fib_zone_low, fib_zone_high):
+            continue
+
+        # Optional extra filter: the candidate OB must also overlap the active H1 refinement zone.
+        if zone_low is not None and zone_high is not None:
+            if not _price_ranges_overlap(wick_low, wick_high, float(zone_low), float(zone_high)):
+                continue
+
+        candidates.append(int(idx))
+
+    if not candidates:
+        return None
+
+    if selection_mode == "most_recent":
+        chosen_idx = candidates[-1]
+    elif selection_mode == "largest_body":
+        chosen_idx = max(
+            candidates,
+            key=lambda i: abs(float(df.loc[i]["close"]) - float(df.loc[i]["open"])),
+        )
+    else:
+        # closest_to_extreme: supply from highest qualified candle; demand from lowest qualified candle.
+        if bias == BEARISH:
+            chosen_idx = max(candidates, key=lambda i: (float(df.loc[i]["high"]), i))
+        else:
+            chosen_idx = min(candidates, key=lambda i: (float(df.loc[i]["low"]), -i))
+
+    # Optional cluster only with adjacent opposite candles, kept small by default.
+    cluster_start = chosen_idx
+    cluster_count = 1
+    max_cluster = max(1, int(max_cluster))
+    while cluster_count < max_cluster:
+        prev_idx = cluster_start - 1
+        if prev_idx < int(search.index.min()):
+            break
+        prev = df.loc[prev_idx]
+        is_opposite = (float(prev["close"]) > float(prev["open"])) if bias == BEARISH else (float(prev["close"]) < float(prev["open"]))
+        if not is_opposite:
+            break
+        cluster_start = prev_idx
+        cluster_count += 1
+
+    ob = _ob_from_cluster(
+        df,
+        cluster_start=cluster_start,
+        chosen_idx=chosen_idx,
+        bias=bias,
+        ob_type=ob_type,
+        displacement_index=break_index,
+        use_body_only=use_body_only,
+    )
+    if not ob:
+        return None
+
+    if is_ob_invalidated(df, ob, use_close=True):
+        return None
+
+    ob = dict(ob)
+    ob["timeframe"] = timeframe_label
+    ob["fib_confirmed"] = True
+    ob["fib_ob_method"] = "manual_impulse_premium_discount"
+    ob["fib_zone_low"] = float(min(fib_zone_low, fib_zone_high))
+    ob["fib_zone_high"] = float(max(fib_zone_low, fib_zone_high))
+    ob["fib_level_min"] = float(fib_min)
+    ob["fib_level_max"] = float(fib_max)
+    ob["impulse_high"] = float(impulse_high)
+    ob["impulse_low"] = float(impulse_low)
+    ob["impulse_high_idx"] = int(impulse_high_idx)
+    ob["impulse_low_idx"] = int(impulse_low_idx)
+    ob["source_event"] = {
+        "direction": event.get("direction"),
+        "tag": event.get("tag"),
+        "level": event.get("level"),
+        "level_time": event.get("level_time"),
+        "break_time": event.get("break_time"),
+        "break_close": event.get("break_close"),
+    }
+    return ob
+
+
+def last_fib_confirmed_ob(events, df: pd.DataFrame, bias: int, timeframe_label: str, zone_low=None, zone_high=None):
+    """Return the most recent valid fib-confirmed OB for the requested direction."""
+    if not events:
+        return None
+
+    lookback_events = _env_int_core("SMC_FIB_OB_LOOKBACK_EVENTS", 6)
+    checked = 0
+    for event in reversed(events):
+        if event.get("bias") != bias:
+            continue
+        checked += 1
+        ob = build_fib_confirmed_ob_from_event(
+            df,
+            event,
+            bias,
+            timeframe_label,
+            zone_low=zone_low,
+            zone_high=zone_high,
+        )
+        if ob:
+            return ob
+        if checked >= lookback_events:
+            break
+    return None
+
 def select_active_ob(
     trade_direction,
     trade_mode,
@@ -677,6 +1161,9 @@ def select_active_ob(
     swing_high,
     equilibrium,
     fibs,
+    h1_supply_ob=None,
+    h1_demand_ob=None,
+    current_price=None,
 ):
     if trade_direction is None:
         return None, None, None, None, "none", False
@@ -691,8 +1178,21 @@ def select_active_ob(
     discount_high = equilibrium
 
     zone_name = "none"
+    h1_context_ob = get_h1_context_ob(
+        trade_direction,
+        trade_mode,
+        float(current_price) if current_price is not None else float(equilibrium),
+        h1_supply_ob,
+        h1_demand_ob,
+    )
 
-    if trade_mode == "continuation":
+    if h1_context_ob:
+        # This is the key change: inside H1 OB, refine the trade using the H1 OB,
+        # not the broad premium/discount half of the swing.
+        zone_low = float(h1_context_ob["low"])
+        zone_high = float(h1_context_ob["high"])
+        zone_name = "h1_supply_refinement_zone" if trade_direction == BEARISH else "h1_demand_refinement_zone"
+    elif trade_mode == "continuation":
         zone_low = poi_bottom
         zone_high = poi_top
         zone_name = "external_fib_poi"
@@ -709,33 +1209,6 @@ def select_active_ob(
     selected_ob_source = "fallback_last_valid"
     selected_ob_locked = False
 
-    # Prefer the source OB that created the selected internal break event.
-    source_selected_ob = None
-    if internal_event_pack and internal_event_pack.get("event"):
-        source_event = internal_event_pack["event"]
-        source_ob = source_event.get("order_block")
-        source_tf = internal_event_pack.get("timeframe")
-        source_df = m15 if source_tf == "M15" else m5
-        if source_ob:
-            source_ok = (
-                source_ob.get("bias") == trade_direction
-                and not is_ob_invalidated(source_df, source_ob, use_close=True)
-                and ob_overlaps_zone(source_ob, zone_low, zone_high)
-            )
-            if source_ok:
-                source_selected_ob = dict(source_ob)
-                source_selected_ob["timeframe"] = source_tf
-                source_selected_ob["source_selected_ob"] = True
-                source_selected_ob["source_event"] = {
-                    "direction": source_event.get("direction"),
-                    "tag": source_event.get("tag"),
-                    "level": source_event.get("level"),
-                    "level_time": source_event.get("level_time"),
-                    "break_time": source_event.get("break_time"),
-                }
-                selected_ob_source = "internal_event_source"
-                selected_ob_locked = True
-
     m15_ob = last_valid_ob(
         m15_result["events"], m15, trade_direction, "M15",
         zone_low=zone_low, zone_high=zone_high
@@ -745,7 +1218,85 @@ def select_active_ob(
         zone_low=zone_low, zone_high=zone_high
     )
 
-    selected_ob = source_selected_ob if source_selected_ob else select_ob_by_preference(m15_ob, m5_ob)
+    fib_selection_enabled = env_bool("SMC_FIB_CONFIRMED_OB_ENABLED", True)
+    fib_require_for_execution = env_bool("SMC_FIB_CONFIRMED_OB_REQUIRE_FOR_EXECUTION", True)
+    m15_fib_ob = None
+    m5_fib_ob = None
+
+    if fib_selection_enabled:
+        m15_fib_ob = last_fib_confirmed_ob(
+            m15_result["events"], m15, trade_direction, "M15",
+            zone_low=zone_low, zone_high=zone_high
+        )
+        m5_fib_ob = last_fib_confirmed_ob(
+            m5_result["events"], m5, trade_direction, "M5",
+            zone_low=zone_low, zone_high=zone_high
+        )
+
+        # If a fib-confirmed OB exists, it replaces the generic OB candidate.
+        # If none exists and the guard is enabled, no executable zone is allowed.
+        if m15_fib_ob:
+            m15_ob = m15_fib_ob
+        if m5_fib_ob:
+            m5_ob = m5_fib_ob
+        if fib_require_for_execution and not (m15_fib_ob or m5_fib_ob):
+            return None, m15_ob, m5_ob, zone_name, "fib_confirmed_ob_missing", False
+
+    selected_ob = None
+
+    # Inside H1 supply/demand, M15 refinement must be checked before M5.
+    # This prevents the EA from choosing the lower M5 OB when the cleaner M15 OB
+    # is the one that should protect the trade from normal H1-zone noise.
+    if h1_context_ob and env_bool("SMC_H1_OB_M15_FIRST", True):
+        selected_ob = m15_ob if m15_ob else m5_ob
+        selected_ob_source = "h1_context_m15_first" if selected_ob else "h1_context_no_ltf_ob"
+        selected_ob_locked = bool(selected_ob)
+    else:
+        # Prefer the source OB that created the selected internal break event only outside H1 OB context.
+        source_selected_ob = None
+        if internal_event_pack and internal_event_pack.get("event"):
+            source_event = internal_event_pack["event"]
+            source_ob = source_event.get("order_block")
+            source_tf = internal_event_pack.get("timeframe")
+            source_df = m15 if source_tf == "M15" else m5
+            if source_ob:
+                source_ok = (
+                    source_ob.get("bias") == trade_direction
+                    and not is_ob_invalidated(source_df, source_ob, use_close=True)
+                    and ob_overlaps_zone(source_ob, zone_low, zone_high)
+                )
+                if source_ok:
+                    source_selected_ob = dict(source_ob)
+                    source_selected_ob["timeframe"] = source_tf
+                    source_selected_ob["source_selected_ob"] = True
+                    source_selected_ob["source_event"] = {
+                        "direction": source_event.get("direction"),
+                        "tag": source_event.get("tag"),
+                        "level": source_event.get("level"),
+                        "level_time": source_event.get("level_time"),
+                        "break_time": source_event.get("break_time"),
+                    }
+                    selected_ob_source = "internal_event_source"
+                    selected_ob_locked = True
+
+        if fib_selection_enabled and (m15_fib_ob or m5_fib_ob):
+            prefer_m15 = env_bool("SMC_FIB_OB_M15_FIRST", True)
+            selected_ob = m15_fib_ob if (prefer_m15 and m15_fib_ob) else most_recent_ob(m15_fib_ob, m5_fib_ob)
+            selected_ob_source = "fib_confirmed_m15_m5"
+            selected_ob_locked = True
+        else:
+            prefer_m15_general = env_bool("SMC_PREFER_M15_OB", True)
+            if prefer_m15_general and m15_ob:
+                selected_ob = m15_ob
+            else:
+                selected_ob = source_selected_ob if source_selected_ob else most_recent_ob(m15_ob, m5_ob)
+
+    if selected_ob and h1_context_ob:
+        selected_ob = dict(selected_ob)
+        selected_ob["h1_context_ob"] = h1_context_ob
+        selected_ob["inside_h1_ob"] = True
+        selected_ob["h1_refinement_priority"] = "M15_FIRST"
+
     return selected_ob, m15_ob, m5_ob, zone_name, selected_ob_source, selected_ob_locked
 
 
@@ -972,6 +1523,124 @@ def detect_ob_flip_candidates(m15_result, m5_result, m15, m5, current_price):
     return out
 
 
+
+def build_live_flip_execution_candidate(
+    latest_flip,
+    internal_event_pack,
+    m15_result,
+    m5_result,
+    m15,
+    m5,
+    swing_low,
+    swing_high,
+    equilibrium,
+    fibs,
+    h1_supply_ob,
+    h1_demand_ob,
+    current_price,
+    inside_h1_supply=False,
+    inside_h1_demand=False,
+    h1_context_override_enabled=True,
+):
+    """
+    Convert a validated flip candidate into a normal executable BUY/SELL decision.
+
+    Important safety rules:
+    - Flip alone is not a trade.
+    - Flip must be confirmed by the latest M5/M15 BOS/CHoCH direction.
+    - A fib-confirmed OB/retest zone must exist; select_active_ob() enforces this
+      when SMC_FIB_CONFIRMED_OB_REQUIRE_FOR_EXECUTION=true.
+    - Lower timeframe bullish flips are blocked while price is still inside valid
+      H1 supply; bearish flips are blocked while price is inside valid H1 demand.
+    """
+    if not latest_flip:
+        return None, "No flip candidate available"
+
+    if not env_bool("SMC_ENABLE_FLIP_ENTRIES", False):
+        return None, "SMC_ENABLE_FLIP_ENTRIES=false"
+
+    invalidated_type = str(latest_flip.get("invalidated_ob_type") or "").lower()
+    if invalidated_type == "supply":
+        flip_direction = BULLISH
+        executable_decision = "BUY_CONTINUATION"
+        zone_name = "bullish_flip_fib_retest_zone"
+        flip_type = f"{latest_flip.get('timeframe', 'M5')}_SUPPLY_INVALIDATED_BULLISH_FLIP"
+        if h1_context_override_enabled and inside_h1_supply:
+            return None, "Bullish flip blocked: price is still inside valid H1 supply"
+    elif invalidated_type == "demand":
+        flip_direction = BEARISH
+        executable_decision = "SELL_CONTINUATION"
+        zone_name = "bearish_flip_fib_retest_zone"
+        flip_type = f"{latest_flip.get('timeframe', 'M5')}_DEMAND_INVALIDATED_BEARISH_FLIP"
+        if h1_context_override_enabled and inside_h1_demand:
+            return None, "Bearish flip blocked: price is still inside valid H1 demand"
+    else:
+        return None, f"Unsupported flip invalidated_ob_type={invalidated_type}"
+
+    # Confirmation: latest internal BOS/CHoCH must agree with the flip direction.
+    if not internal_event_pack or not internal_event_pack.get("event"):
+        return None, "Flip blocked: no internal BOS/CHoCH confirmation available"
+
+    internal_event = internal_event_pack["event"]
+    if internal_event.get("bias") != flip_direction:
+        return None, (
+            "Flip blocked: internal confirmation does not agree with flip direction. "
+            f"internal_bias={bias_text(internal_event.get('bias'))}, flip_direction={bias_text(flip_direction)}"
+        )
+
+    # Find the executable fib-confirmed OB in the flip direction. This keeps the
+    # manual method active: flip + confirmation + fib-confirmed retest zone.
+    selected_ob, m15_ob, m5_ob, selected_zone_name, selected_ob_source, selected_ob_locked = select_active_ob(
+        flip_direction,
+        "continuation",
+        internal_event_pack,
+        m15_result,
+        m5_result,
+        m15,
+        m5,
+        swing_low,
+        swing_high,
+        equilibrium,
+        fibs,
+        h1_supply_ob=h1_supply_ob,
+        h1_demand_ob=h1_demand_ob,
+        current_price=current_price,
+    )
+
+    if not selected_ob:
+        return None, (
+            "Flip blocked: no fib-confirmed executable OB/retest zone found after flip. "
+            f"selector_source={selected_ob_source}"
+        )
+
+    if env_bool("SMC_FLIP_REQUIRE_FIB_CONFIRMED_OB", True) and not bool(selected_ob.get("fib_confirmed")):
+        return None, "Flip blocked: selected OB is not fib-confirmed"
+
+    selected_ob = dict(selected_ob)
+    selected_ob["flip_entry_ob"] = True
+    selected_ob["flip_type"] = flip_type
+    selected_ob["flip_timeframe"] = latest_flip.get("timeframe")
+    selected_ob["flip_invalidated_ob_type"] = invalidated_type
+    selected_ob["flip_source_ob"] = latest_flip.get("ob")
+
+    return {
+        "decision": executable_decision,
+        "trade_direction": flip_direction,
+        "trade_mode": "continuation",
+        "selected_ob": selected_ob,
+        "selected_ob_source": "flip_fib_confirmed_ob",
+        "selected_ob_locked": True,
+        "zone_name": zone_name,
+        "selector_zone_name": selected_zone_name,
+        "flip_type": flip_type,
+        "flip_timeframe": latest_flip.get("timeframe"),
+        "flip_direction": "buy" if flip_direction == BULLISH else "sell",
+        "flip_candidate": latest_flip,
+        "m15_flip_ob_available": bool(m15_ob),
+        "m5_flip_ob_available": bool(m5_ob),
+        "reason": "Flip + internal confirmation + fib-confirmed OB/retest converted to executable decision",
+    }, None
+
 def build_overlay(symbol: str):
     swing_length = int(os.getenv("SMC_SWING_LENGTH", "20"))
     internal_length = int(os.getenv("SMC_INTERNAL_LENGTH", "3"))
@@ -1012,6 +1681,14 @@ def build_overlay(symbol: str):
     fibs = fib_prices(swing_low, swing_high, external_bias)
     current_location = price_location(current_price, swing_low, swing_high)
 
+    # Active H1 OBs are separate from simple premium/discount.
+    # Use swing/rejection OBs first because H1 supply/demand can exist before H1 BOS/CHoCH.
+    # Fall back to structure-event OBs only if no rejection OB is available.
+    h1_supply_ob = find_rejection_order_block(h1, h1_result, BEARISH, "H1") or last_valid_ob(h1_result["events"], h1, BEARISH, "H1")
+    h1_demand_ob = find_rejection_order_block(h1, h1_result, BULLISH, "H1") or last_valid_ob(h1_result["events"], h1, BULLISH, "H1")
+
+    pd_detail = pd_range_detail(current_price, swing_low, swing_high)
+
     internal_event_pack = choose_internal_event(m15_result, m5_result, m15, m5)
 
     decision, trade_direction, trade_mode = decide_trade_context(
@@ -1034,6 +1711,9 @@ def build_overlay(symbol: str):
         swing_high,
         equilibrium,
         fibs,
+        h1_supply_ob=h1_supply_ob,
+        h1_demand_ob=h1_demand_ob,
+        current_price=current_price,
     )
 
     h1_source_ob, retrace_ref_ob = select_reference_zones(
@@ -1053,20 +1733,69 @@ def build_overlay(symbol: str):
     internal_m15_structure = get_internal_structure_levels(m15_result, m15, "M15")
     ob_flip_candidates = detect_ob_flip_candidates(m15_result, m5_result, m15, m5, current_price)
 
-    show_ob_invalidations = os.getenv("SMC_SHOW_OB_INVALIDATIONS", "true").lower() == "true"
+    # ------------------------------------------------------------------
+    # H1 OB CONTEXT OVERRIDE
+    # ------------------------------------------------------------------
+    # SMC priority should be:
+    #     H1 OB context > true PD zone > M15/M5 flip candidate.
+    #
+    # If price is still inside a valid H1 supply, a lower-timeframe bullish
+    # supply invalidation is NOT permission to buy yet. It should be treated
+    # as internal noise until H1 supply is invalidated by an H1 close above
+    # the H1 supply high. The mirror rule applies for H1 demand.
+    h1_supply_valid = bool(h1_supply_ob) and not is_ob_invalidated(h1, h1_supply_ob, use_close=True)
+    h1_demand_valid = bool(h1_demand_ob) and not is_ob_invalidated(h1, h1_demand_ob, use_close=True)
+    inside_h1_supply = bool(h1_supply_valid and price_inside_ob(current_price, h1_supply_ob))
+    inside_h1_demand = bool(h1_demand_valid and price_inside_ob(current_price, h1_demand_ob))
+
+    h1_ob_context = "none"
+    if inside_h1_supply:
+        h1_ob_context = "inside_h1_supply"
+    elif inside_h1_demand:
+        h1_ob_context = "inside_h1_demand"
+
+    h1_context_override_enabled = env_bool("SMC_H1_OB_CONTEXT_OVERRIDE_ENABLED", default=True)
+
+    show_ob_invalidations = os.getenv("SMC_FLIP_CANDIDATE_VISUAL_ONLY", "true").lower() != "false" or os.getenv("SMC_SHOW_OB_INVALIDATIONS", "true").lower() == "true"
     flip_visual_only = os.getenv("SMC_FLIP_CANDIDATE_VISUAL_ONLY", "true").lower() == "true"
     diagnostic_decision = None
     if show_ob_invalidations and flip_visual_only:
         has_bull_flip = bool(ob_flip_candidates["m5_bullish_flip"] or ob_flip_candidates["m15_bullish_flip"])
         has_bear_flip = bool(ob_flip_candidates["m5_bearish_flip"] or ob_flip_candidates["m15_bearish_flip"])
-        if external_bias == BULLISH and current_location == "premium" and has_bull_flip:
+
+        executable_sell_from_h1_supply = bool(
+            selected_ob
+            and trade_direction == BEARISH
+            and str(decision).startswith("SELL_")
+        )
+        executable_buy_from_h1_demand = bool(
+            selected_ob
+            and trade_direction == BULLISH
+            and str(decision).startswith("BUY_")
+        )
+
+        if h1_context_override_enabled and inside_h1_supply and not executable_sell_from_h1_supply:
+            diagnostic_decision = "WAIT_SELL_CONFIRMATION_FROM_H1_SUPPLY"
+            decision = diagnostic_decision
+            trade_mode = "diagnostic"
+            trade_direction = None
+            selected_ob = None
+            zone_name = "h1_supply_rejection"
+        elif h1_context_override_enabled and inside_h1_demand and not executable_buy_from_h1_demand:
+            diagnostic_decision = "WAIT_BUY_CONFIRMATION_FROM_H1_DEMAND"
+            decision = diagnostic_decision
+            trade_mode = "diagnostic"
+            trade_direction = None
+            selected_ob = None
+            zone_name = "h1_demand_rejection"
+        elif external_bias == BULLISH and pd_detail.get("pd_label") in {"true_premium", "deep_premium", "extreme_premium"} and has_bull_flip:
             diagnostic_decision = "WAIT_BUY_PULLBACK_AFTER_SUPPLY_INVALIDATION"
             decision = diagnostic_decision
             trade_mode = "diagnostic"
             trade_direction = None
             selected_ob = None
             zone_name = "bullish_flip_reference"
-        elif external_bias == BEARISH and current_location == "discount" and has_bear_flip:
+        elif external_bias == BEARISH and pd_detail.get("pd_label") in {"true_discount", "deep_discount", "extreme_discount"} and has_bear_flip:
             diagnostic_decision = "WAIT_SELL_PULLBACK_AFTER_DEMAND_INVALIDATION"
             decision = diagnostic_decision
             trade_mode = "diagnostic"
@@ -1075,6 +1804,41 @@ def build_overlay(symbol: str):
             zone_name = "bearish_flip_reference"
 
     latest_flip = get_latest_flip_candidate(ob_flip_candidates)
+
+    flip_used_for_entry = False
+    flip_entry_details = None
+    flip_entry_block_reason = None
+
+    if env_bool("SMC_ENABLE_FLIP_ENTRIES", False) and not flip_visual_only:
+        flip_entry_details, flip_entry_block_reason = build_live_flip_execution_candidate(
+            latest_flip,
+            internal_event_pack,
+            m15_result,
+            m5_result,
+            m15,
+            m5,
+            swing_low,
+            swing_high,
+            equilibrium,
+            fibs,
+            h1_supply_ob,
+            h1_demand_ob,
+            current_price,
+            inside_h1_supply=inside_h1_supply,
+            inside_h1_demand=inside_h1_demand,
+            h1_context_override_enabled=h1_context_override_enabled,
+        )
+
+        if flip_entry_details:
+            decision = flip_entry_details["decision"]
+            trade_direction = flip_entry_details["trade_direction"]
+            trade_mode = flip_entry_details["trade_mode"]
+            selected_ob = flip_entry_details["selected_ob"]
+            selected_ob_source = flip_entry_details["selected_ob_source"]
+            selected_ob_locked = flip_entry_details["selected_ob_locked"]
+            zone_name = flip_entry_details["zone_name"]
+            diagnostic_decision = None
+            flip_used_for_entry = True
 
     flip_reference_ob, flip_reference_ob_source, flip_reference_ob_missing_reason = get_flip_reference_ob(
         diagnostic_decision,
@@ -1095,8 +1859,9 @@ def build_overlay(symbol: str):
 
     # Clean mode should be a trading dashboard, not a debug chart.
     show_reference_zones = env_bool("SMC_SHOW_REFERENCE_ZONES", default=not is_clean_visual)
-    show_h1_structure = env_bool("SMC_SHOW_H1_STRUCTURE", default=not is_clean_visual)
-    show_h1_strong_weak = env_bool("SMC_SHOW_H1_STRONG_WEAK", default=not is_clean_visual)
+    show_h1_structure = env_bool("SMC_SHOW_H1_STRUCTURE", default=True)
+    show_h1_strong_weak = env_bool("SMC_SHOW_H1_STRONG_WEAK", default=True)
+    show_h1_obs = env_bool("SMC_SHOW_H1_OBS", default=True)
     show_chart_flip_zones = env_bool("SMC_SHOW_FLIP_ZONES_ON_CHART", default=is_debug_visual)
     show_fib_labels_minimal = env_bool("SMC_SHOW_FIB_LABELS_MINIMAL", default=True)
 
@@ -1109,17 +1874,97 @@ def build_overlay(symbol: str):
     else:
         internal_text = "None"
 
+    # ------------------------------------------------------------------
+    # DASHBOARD CLEANUP / PRIORITY
+    # ------------------------------------------------------------------
+    # The dashboard should show the CURRENT dominant state.  A previous
+    # bullish flip must not keep showing as the primary message once H1
+    # supply + bearish confirmation has produced a sell context.  The
+    # mirror rule applies for bearish flips once demand + bullish
+    # confirmation is dominant.
+    dashboard_suppressed_flip = None
+    dashboard_flip = latest_flip
+    if dashboard_flip:
+        flip_msg = str(dashboard_flip.get("message", "")).upper()
+        flip_is_bullish = "BULLISH" in flip_msg or dashboard_flip.get("invalidated_ob_type") == "supply"
+        flip_is_bearish = "BEARISH" in flip_msg or dashboard_flip.get("invalidated_ob_type") == "demand"
+
+        sell_context_active = (
+            str(decision).startswith("SELL_")
+            or decision == "WAIT_SELL_CONFIRMATION_FROM_H1_SUPPLY"
+            or h1_ob_context == "inside_h1_supply"
+        )
+        buy_context_active = (
+            str(decision).startswith("BUY_")
+            or decision == "WAIT_BUY_CONFIRMATION_FROM_H1_DEMAND"
+            or h1_ob_context == "inside_h1_demand"
+        )
+
+        if sell_context_active and flip_is_bullish:
+            dashboard_suppressed_flip = dashboard_flip
+            dashboard_flip = None
+        elif buy_context_active and flip_is_bearish:
+            dashboard_suppressed_flip = dashboard_flip
+            dashboard_flip = None
+
+    # ------------------------------------------------------------------
+    # DASHBOARD ACTIVE-ZONE NORMALIZATION
+    # ------------------------------------------------------------------
+    # The execution decision may remain SELL_RETRACEMENT even after price has
+    # moved out of the H1 supply rectangle.  In that case h1_ob_context can be
+    # "none" because price is no longer literally inside the H1 OB, but the
+    # trade idea is still a rejection/refinement from that H1 supply.  The
+    # dashboard should therefore show the dominant H1 context, not fall back to
+    # generic "premium_retracement_zone".
+    decision_text = str(decision)
+    pd_label_text = str(pd_detail.get("pd_label", ""))
+    selected_source_text = str(selected_ob_source or "")
+
+    h1_supply_dashboard_context = bool(h1_supply_ob) and (
+        h1_ob_context == "inside_h1_supply"
+        or selected_source_text.startswith("h1_context")
+        or (
+            decision_text.startswith("SELL_")
+            and ("premium" in str(current_location).lower() or "premium" in pd_label_text.lower())
+        )
+    )
+    h1_demand_dashboard_context = bool(h1_demand_ob) and (
+        h1_ob_context == "inside_h1_demand"
+        or selected_source_text.startswith("h1_context")
+        or (
+            decision_text.startswith("BUY_")
+            and ("discount" in str(current_location).lower() or "discount" in pd_label_text.lower())
+        )
+    )
+
+    dashboard_h1_context_text = None
+    dashboard_zone_name = zone_name
+    if h1_supply_dashboard_context and (decision_text.startswith("SELL_") or "SELL_CONFIRMATION" in decision_text):
+        dashboard_zone_name = "h1_supply_refined_sell_zone"
+        dashboard_h1_context_text = "h1_supply_rejection"
+    elif h1_demand_dashboard_context and (decision_text.startswith("BUY_") or "BUY_CONFIRMATION" in decision_text):
+        dashboard_zone_name = "h1_demand_refined_buy_zone"
+        dashboard_h1_context_text = "h1_demand_rejection"
+    elif h1_ob_context != "none":
+        dashboard_h1_context_text = h1_ob_context
+
     add_label(lines, "AI_SMC_DASHBOARD_1", 12, 22, f"AI SMC | {symbol}", "yellow")
-    add_label(lines, "AI_SMC_DASHBOARD_2", 12, 42, f"External H1: {external_text} | Location: {current_location}", "yellow")
+    add_label(lines, "AI_SMC_DASHBOARD_2", 12, 42, f"External H1: {external_text} | Location: {current_location} | PD: {pd_detail['pd_label']}", "yellow")
     add_label(lines, "AI_SMC_DASHBOARD_3", 12, 62, f"Internal: {internal_text}", "white")
     add_label(lines, "AI_SMC_DASHBOARD_4", 12, 82, f"Decision: {decision} | Mode: {trade_mode}", "white")
 
     dashboard_status_y = 102
     dashboard_active_y = 122
-    if latest_flip:
-        add_label(lines, "AI_SMC_DASHBOARD_FLIP", 12, 102, f"Flip: {latest_flip['timeframe']} {latest_flip['message']}", "orange")
-        dashboard_status_y = 122
-        dashboard_active_y = 142
+
+    if dashboard_h1_context_text:
+        add_label(lines, "AI_SMC_DASHBOARD_H1_CONTEXT", 12, dashboard_status_y, f"H1 OB Context: {dashboard_h1_context_text}", "orange")
+        dashboard_status_y += 20
+        dashboard_active_y += 20
+
+    if dashboard_flip:
+        add_label(lines, "AI_SMC_DASHBOARD_FLIP", 12, dashboard_status_y, f"Flip: {dashboard_flip['timeframe']} {dashboard_flip['message']}", "orange")
+        dashboard_status_y += 20
+        dashboard_active_y += 20
 
     fib_start_time = min(swing_low_time, swing_high_time)
     fib_end_time = right_time
@@ -1185,7 +2030,7 @@ def build_overlay(symbol: str):
         add_text(lines, "AI_SMC_WEAK_LOW_TEXT", swing_low_time, swing_low - point * 22, "Weak Low", "green")
 
     # INTERNAL STRUCTURE
-    show_internal_structure = env_bool("SMC_SHOW_INTERNAL_STRUCTURE", default=not is_clean_visual)
+    show_internal_structure = env_bool("SMC_SHOW_INTERNAL_STRUCTURE", default=True)
     if internal_event_pack and show_internal_structure:
         internal_tf = internal_event_pack["timeframe"]
         internal_event = internal_event_pack["event"]
@@ -1211,9 +2056,37 @@ def build_overlay(symbol: str):
             internal_color,
         )
 
+    # M5 STRUCTURE — force M5 BOS/CHoCH print separately from the active internal event.
+    # This ensures M5 BOS/CHoCH remains visible even if the active confirmation pack
+    # is M15 or the dashboard is in clean mode.
+    show_m5_structure = env_bool("SMC_SHOW_M5_STRUCTURE", default=True)
+    if show_m5_structure and m5_result.get("events"):
+        m5_last_event = m5_result["events"][-1]
+        m5_color = "green" if m5_last_event["bias"] == BULLISH else "red"
+        m5_label = f"M5 {m5_last_event['direction'].upper()} {m5_last_event['tag']}"
+
+        add_line(
+            lines,
+            "AI_SMC_M5_LAST_STRUCTURE",
+            m5_last_event["level_time"],
+            m5_last_event["break_time"],
+            m5_last_event["level"],
+            m5_last_event["level"],
+            "",
+            m5_color,
+        )
+        add_text(
+            lines,
+            "AI_SMC_M5_LAST_STRUCTURE_TEXT",
+            m5_last_event["break_time"],
+            m5_last_event["level"] - point * 28,
+            m5_label,
+            m5_color,
+        )
+
     # INTERNAL SWINGS
     # Respect .env directly. Earlier versions blocked this in clean mode.
-    show_internal_swings = env_bool("SMC_SHOW_INTERNAL_SWINGS", default=False)
+    show_internal_swings = env_bool("SMC_SHOW_INTERNAL_SWINGS", default=True)
 
     if show_internal_swings:
         if internal_event_pack and internal_event_pack["timeframe"] == "M15":
@@ -1236,7 +2109,7 @@ def build_overlay(symbol: str):
     # Respect .env directly. If SMC_SHOW_INTERNAL_STRONG_WEAK=true, show it even in clean mode.
     show_internal_strong_weak = env_bool(
         "SMC_SHOW_INTERNAL_STRONG_WEAK",
-        default=env_bool("SMC_CLEAN_SHOW_INTERNAL_STRONG_WEAK", default=not is_clean_visual),
+        default=True,
     )
 
     if show_internal_strong_weak:
@@ -1268,13 +2141,12 @@ def build_overlay(symbol: str):
                 add_line(lines, f"AI_SMC_{tf}_WEAK_LOW", t, right_time, p, p, "", "white")
                 add_text(lines, f"AI_SMC_{tf}_WEAK_LOW_TEXT", right_time, p - point * 14, f"{tf} Weak Low", "white")
 
-        if is_debug_visual:
-            _draw_internal_levels(internal_m5_structure, "cyan", "cyan")
+        # Always draw M5 strong/weak structure when enabled.
+        # In debug mode, also draw M15. In trade/clean mode, draw M15 only if it is the active confirmation timeframe.
+        _draw_internal_levels(internal_m5_structure, "cyan", "cyan")
+        active_tf = internal_event_pack["timeframe"] if internal_event_pack else "M5"
+        if is_debug_visual or active_tf == "M15":
             _draw_internal_levels(internal_m15_structure, "magenta", "magenta")
-        else:
-            active_tf = internal_event_pack["timeframe"] if internal_event_pack else "M5"
-            active_levels = internal_m15_structure if active_tf == "M15" else internal_m5_structure
-            _draw_internal_levels(active_levels, "cyan", "cyan")
 
     # Respect .env directly. Keep false by default to avoid noise.
     show_previous_structure = env_bool("SMC_SHOW_PREVIOUS_STRUCTURE", default=False)
@@ -1338,6 +2210,48 @@ def build_overlay(symbol: str):
         elif latest_flip:
             color = "lime" if latest_flip["invalidated_ob_type"] == "supply" else "orange"
             _draw_flip(latest_flip, f"{latest_flip['timeframe']}_LATEST_FLIP", color)
+
+    # H1 ORDER BLOCKS: always separate from broad premium/discount.
+    # These zones are the higher-timeframe supply/demand context used for refinement.
+    if show_h1_obs:
+        if h1_supply_ob:
+            add_rect(
+                lines,
+                "AI_SMC_H1_SUPPLY_OB",
+                h1_supply_ob["time"],
+                right_time,
+                h1_supply_ob["high"],
+                h1_supply_ob["low"],
+                "",
+                "orange",
+            )
+            add_text(
+                lines,
+                "AI_SMC_H1_SUPPLY_OB_TEXT",
+                right_time,
+                (h1_supply_ob["high"] + h1_supply_ob["low"]) / 2.0 + point * 20,
+                f"H1 SUPPLY OB | {h1_supply_ob.get('source', 'structure')} | C{h1_supply_ob.get('cluster_count', '?')}",
+                "orange",
+            )
+        if h1_demand_ob:
+            add_rect(
+                lines,
+                "AI_SMC_H1_DEMAND_OB",
+                h1_demand_ob["time"],
+                right_time,
+                h1_demand_ob["high"],
+                h1_demand_ob["low"],
+                "",
+                "blue",
+            )
+            add_text(
+                lines,
+                "AI_SMC_H1_DEMAND_OB_TEXT",
+                right_time,
+                (h1_demand_ob["high"] + h1_demand_ob["low"]) / 2.0 - point * 20,
+                f"H1 DEMAND OB | {h1_demand_ob.get('source', 'structure')} | C{h1_demand_ob.get('cluster_count', '?')}",
+                "blue",
+            )
 
     # REFERENCE ZONE 1: H1 SOURCE ZONE (hidden in clean mode by default)
     if h1_source_ob and show_reference_zones:
@@ -1417,7 +2331,8 @@ def build_overlay(symbol: str):
     # ACTIVE CURRENT OB
     if selected_ob:
         ob_color = "green" if selected_ob["bias"] == BULLISH else "red"
-        ob_label = f"{selected_ob['timeframe']} ACTIVE {'DEMAND' if selected_ob['bias'] == BULLISH else 'SUPPLY'} OB"
+        fib_tag = "FIB " if selected_ob.get("fib_confirmed") else ""
+        ob_label = f"{selected_ob['timeframe']} {fib_tag}ACTIVE {'DEMAND' if selected_ob['bias'] == BULLISH else 'SUPPLY'} OB"
 
         add_rect(
             lines,
@@ -1444,19 +2359,28 @@ def build_overlay(symbol: str):
     take_profit = None
     rr = float(os.getenv("SMC_RR", "3.0"))
 
+    stop_source = "none"
+    buffer_pips = float(os.getenv("OB_BUFFER_PIPS", "3"))
+    buffer_price = buffer_pips * point * 10 if point < 0.001 else buffer_pips * point
+
     if selected_ob and trade_direction:
         if trade_direction == BULLISH:
             entry = selected_ob["high"]
-            stop_loss = selected_ob["low"]
-            risk = entry - stop_loss
-            if risk > 0:
-                take_profit = entry + risk * rr
+            normal_stop = selected_ob["low"] - buffer_price
+            stop_loss, take_profit, stop_source = apply_h1_retrace_stop_for_visuals(
+                trade_direction, trade_mode, entry, normal_stop, selected_ob, rr, buffer_price
+            )
         elif trade_direction == BEARISH:
             entry = selected_ob["low"]
-            stop_loss = selected_ob["high"]
-            risk = stop_loss - entry
-            if risk > 0:
-                take_profit = entry - risk * rr
+            normal_stop = selected_ob["high"] + buffer_price
+            stop_loss, take_profit, stop_source = apply_h1_retrace_stop_for_visuals(
+                trade_direction, trade_mode, entry, normal_stop, selected_ob, rr, buffer_price
+            )
+
+        if stop_loss is not None:
+            risk = abs(entry - stop_loss)
+            if risk <= 0:
+                take_profit = None
 
     entry_status = get_entry_status(current_price, entry, trade_direction, point)
     if trade_mode == "diagnostic":
@@ -1474,7 +2398,7 @@ def build_overlay(symbol: str):
         add_text(lines, "AI_SMC_TP_TEXT", right_time, take_profit + point * 26, "TP 1:3", "green")
 
     add_label(lines, "AI_SMC_DASHBOARD_5", 12, dashboard_status_y, f"Status: {entry_status}", "white")
-    add_label(lines, "AI_SMC_DASHBOARD_6", 12, dashboard_active_y, f"Active zone: {zone_name}", "white")
+    add_label(lines, "AI_SMC_DASHBOARD_6", 12, dashboard_active_y, f"Active zone: {dashboard_zone_name}", "white")
 
     output_path = mt5_common_files_dir() / "AI_SMC_OVERLAY.csv"
     output_path.write_text("\n".join(lines), encoding="utf-8")
@@ -1484,6 +2408,14 @@ def build_overlay(symbol: str):
         "current_price": current_price,
         "external_h1_bias": external_text,
         "current_location": current_location,
+        "pd_range_detail": pd_detail,
+        "h1_dealing_range": {
+            "swing_low": swing_low,
+            "swing_high": swing_high,
+            "equilibrium": equilibrium,
+            "premium_start": pd_detail.get("premium_start_price"),
+            "discount_start": pd_detail.get("discount_start_price"),
+        },
         "h1_last_event": {
             "direction": h1_last_event["direction"],
             "tag": h1_last_event["tag"],
@@ -1506,11 +2438,31 @@ def build_overlay(symbol: str):
         "decision": decision,
         "entry_status": entry_status,
         "zone_name": zone_name,
+        "dashboard_zone_name": dashboard_zone_name,
+        "dashboard_h1_context_text": dashboard_h1_context_text,
+        "h1_supply_dashboard_context": h1_supply_dashboard_context,
+        "h1_demand_dashboard_context": h1_demand_dashboard_context,
+        "dashboard_flip_displayed": dashboard_flip,
+        "dashboard_flip_suppressed": dashboard_suppressed_flip,
         "h1_source_ob": h1_source_ob,
+        "h1_supply_ob": h1_supply_ob,
+        "h1_demand_ob": h1_demand_ob,
+        "h1_supply_valid": h1_supply_valid,
+        "h1_demand_valid": h1_demand_valid,
+        "inside_h1_supply": inside_h1_supply,
+        "inside_h1_demand": inside_h1_demand,
+        "h1_ob_context": h1_ob_context,
+        "h1_context_ob": selected_ob.get("h1_context_ob") if selected_ob else None,
+        "inside_h1_ob": bool(selected_ob and selected_ob.get("inside_h1_ob")),
+        "h1_sl_reference": stop_source,
         "retrace_reference_ob": retrace_ref_ob,
         "selected_ob": selected_ob,
         "selected_ob_source": selected_ob_source,
         "selected_ob_locked": selected_ob_locked,
+        "fib_confirmed_ob_enabled": env_bool("SMC_FIB_CONFIRMED_OB_ENABLED", True),
+        "fib_confirmed_ob_required": env_bool("SMC_FIB_CONFIRMED_OB_REQUIRE_FOR_EXECUTION", True),
+        "m15_fib_confirmed_ob": locals().get("m15_fib_ob"),
+        "m5_fib_confirmed_ob": locals().get("m5_fib_ob"),
         "entry": entry,
         "stop_loss": stop_loss,
         "take_profit": take_profit,
@@ -1518,6 +2470,16 @@ def build_overlay(symbol: str):
         "internal_m15_structure": internal_m15_structure,
         "ob_flip_candidates": ob_flip_candidates,
         "diagnostic_decision": diagnostic_decision,
+        "has_flip": bool(latest_flip),
+        "flip_used_for_entry": bool(flip_used_for_entry),
+        "flip_entry_details": flip_entry_details,
+        "flip_entry_block_reason": flip_entry_block_reason,
+        "flip_type": flip_entry_details.get("flip_type") if flip_entry_details else (
+            f"{latest_flip.get('timeframe')}_{str(latest_flip.get('invalidated_ob_type')).upper()}_INVALIDATED" if latest_flip else None
+        ),
+        "flip_timeframe": flip_entry_details.get("flip_timeframe") if flip_entry_details else (latest_flip.get("timeframe") if latest_flip else None),
+        "flip_direction": flip_entry_details.get("flip_direction") if flip_entry_details else None,
+        "flip_entry_model": ("FLIP_AI_ZONE_ENTRY" if flip_used_for_entry else None),
         "flip_reference_ob": flip_reference_ob,
         "flip_reference_ob_source": flip_reference_ob_source,
         "flip_reference_ob_drawn": flip_reference_ob_drawn,
@@ -1527,13 +2489,20 @@ def build_overlay(symbol: str):
             "SMC_SHOW_REFERENCE_ZONES": show_reference_zones,
             "SMC_SHOW_H1_STRUCTURE": show_h1_structure,
             "SMC_SHOW_H1_STRONG_WEAK": show_h1_strong_weak,
+            "SMC_SHOW_H1_OBS": show_h1_obs,
             "SMC_SHOW_INTERNAL_STRUCTURE": show_internal_structure,
+            "SMC_SHOW_M5_STRUCTURE": env_bool("SMC_SHOW_M5_STRUCTURE", default=True),
             "SMC_SHOW_INTERNAL_SWINGS": show_internal_swings,
             "SMC_SHOW_INTERNAL_STRONG_WEAK": show_internal_strong_weak,
             "SMC_SHOW_PREVIOUS_STRUCTURE": show_previous_structure,
             "SMC_SHOW_FLIP_ZONES_ON_CHART": show_chart_flip_zones,
         },
         "overlay_file": str(output_path),
+        "strategy_version": os.getenv("STRATEGY_VERSION", "fib_flip_v8_ai_zone_priority"),
+        "selected_zone_timeframe": selected_ob.get("timeframe") if selected_ob else None,
+        "m15_priority_applied": bool(selected_ob and selected_ob.get("timeframe") == "M15"),
+        "m5_used_as_confirmation": bool(selected_ob and selected_ob.get("timeframe") == "M5" and m15_ob),
+        "flip_entries_enabled": env_bool("SMC_ENABLE_FLIP_ENTRIES", False),
     }
 
     return summary

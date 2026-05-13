@@ -28,6 +28,12 @@ from smc_core import (
     select_active_ob,
 )
 
+try:
+    from smc_core import find_rejection_order_block
+except Exception:
+    def find_rejection_order_block(*args, **kwargs):
+        return None
+
 # Manual mapping override section (edit here if auto-detection fails)
 MANUAL_BARS_COLUMN_MAP: dict[str, str] = {
     # "time": "DateTime",
@@ -92,6 +98,41 @@ def env_int(name: str, default: int) -> int:
 
 def str_to_bool(value: str) -> bool:
     return str(value).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def env_bool(name: str, default: bool = False) -> bool:
+    value = os.getenv(name, "").strip()
+    if not value:
+        return default
+    return str_to_bool(value)
+
+
+
+def apply_h1_context_stop_backtest(decision: str, direction: str, selected_ob: dict, entry: float, normal_stop: float, buffer_price: float):
+    if str(os.getenv("SMC_H1_OB_RETRACE_SL_ENABLED", "true")).strip().lower() not in {"1", "true", "yes", "y", "on"}:
+        return normal_stop, "ltf_ob"
+    if decision not in {"BUY_RETRACEMENT", "SELL_RETRACEMENT"}:
+        return normal_stop, "ltf_ob"
+    h1_ob = selected_ob.get("h1_context_ob") if selected_ob else None
+    if not h1_ob:
+        return normal_stop, "ltf_ob"
+    mode = os.getenv("SMC_H1_OB_RETRACE_SL_MODE", "midpoint").strip().lower()
+    if mode not in {"auto", "midpoint", "extreme", "off"}:
+        mode = "midpoint"
+    if mode == "off":
+        return normal_stop, "ltf_ob"
+    h1_high = float(h1_ob["high"])
+    h1_low = float(h1_ob["low"])
+    h1_mid = (h1_high + h1_low) / 2.0
+    if direction == "sell":
+        if mode == "extreme":
+            return h1_high + buffer_price, "h1_supply_extreme"
+        return max(float(normal_stop), h1_mid), "h1_supply_midpoint_protected"
+    if direction == "buy":
+        if mode == "extreme":
+            return h1_low - buffer_price, "h1_demand_extreme"
+        return min(float(normal_stop), h1_mid), "h1_demand_midpoint_protected"
+    return normal_stop, "ltf_ob"
 
 
 def detect_column(columns: list[str], aliases: list[str]) -> str | None:
@@ -250,27 +291,161 @@ def resample_ohlc(df: pd.DataFrame, rule: str) -> pd.DataFrame:
     return agg
 
 
-def build_trade_candidate(decision: str, trade_mode: str, selected_ob: dict, current_close: float, settings: BacktestSettings):
+def _minutes_since_ob(selected_ob: dict, now: pd.Timestamp | None) -> float | None:
+    if not selected_ob or now is None:
+        return None
+    raw_time = selected_ob.get("time") or selected_ob.get("selected_ob_time")
+    if raw_time is None:
+        return None
+    try:
+        ob_time = pd.Timestamp(raw_time)
+        return max(0.0, (pd.Timestamp(now) - ob_time).total_seconds() / 60.0)
+    except Exception:
+        return None
+
+
+def build_ai_zone_market_candidate(
+    decision: str,
+    trade_mode: str,
+    selected_ob: dict,
+    current_close: float,
+    direction: str,
+    limit_entry: float,
+    normal_stop: float,
+    buffer_price: float,
+    settings: BacktestSettings,
+    now: pd.Timestamp | None = None,
+):
+    """
+    Backtest version of the live AI zone autonomy rule.
+
+    If the ideal OB limit is already missed / not chased, this creates a reduced-risk
+    market-style entry instead of incorrectly counting the missed limit as a normal
+    OB mitigation trade.
+    """
+    if not env_bool("AI_ZONE_AUTONOMY_ENABLED", False):
+        return None, "AI_ZONE_AUTONOMY_ENABLED=false"
+    if not env_bool("AI_ZONE_ALLOW_OB_NOT_MITIGATED_ENTRY", True):
+        return None, "AI_ZONE_ALLOW_OB_NOT_MITIGATED_ENTRY=false"
+    if decision not in VALID_DECISIONS or not selected_ob:
+        return None, "ai_zone_no_valid_decision_or_ob"
+
+    if env_bool("AI_ZONE_REQUIRE_ACTIVE_H1_OB", False):
+        has_h1_context = bool(selected_ob.get("h1_context_ob") or selected_ob.get("inside_h1_ob"))
+        if not has_h1_context:
+            return None, "ai_zone_requires_h1_ob_context"
+
+    wait_minutes = env_float("AI_ZONE_OB_MITIGATION_WAIT_MINUTES", 0.0)
+    age_minutes = _minutes_since_ob(selected_ob, now)
+    if wait_minutes > 0 and age_minutes is not None and age_minutes < wait_minutes:
+        return None, f"ai_zone_waiting_for_ob_mitigation_window_{age_minutes:.1f}_of_{wait_minutes:.1f}_minutes"
+
+    market_entry = float(current_close)
+    distance_from_ob_pips = (
+        (market_entry - float(limit_entry)) / PIP_SIZE
+        if direction == "buy"
+        else (float(limit_entry) - market_entry) / PIP_SIZE
+    )
+    if distance_from_ob_pips <= 0:
+        return None, f"ai_zone_price_has_not_moved_away_from_ob_{distance_from_ob_pips:.1f}_pips"
+
+    min_distance = env_float("AI_ZONE_MIN_DISTANCE_FROM_OB_PIPS", 0.0)
+    max_distance = env_float("AI_ZONE_MAX_DISTANCE_FROM_ACTIVE_ZONE_PIPS", 25.0)
+    if distance_from_ob_pips < min_distance:
+        return None, f"ai_zone_distance_too_small_{distance_from_ob_pips:.1f}_pips"
+    if max_distance > 0 and distance_from_ob_pips > max_distance:
+        return None, f"ai_zone_do_not_chase_distance_{distance_from_ob_pips:.1f}_pips_gt_{max_distance:.1f}"
+
+    stop, stop_source = apply_h1_context_stop_backtest(
+        decision, direction, selected_ob, market_entry, normal_stop, buffer_price
+    )
+    risk = abs(market_entry - stop)
+    if risk <= 0:
+        return None, "ai_zone_invalid_risk_distance"
+
+    moved_r_from_ob = abs(market_entry - float(limit_entry)) / risk if risk > 0 else 999.0
+    max_moved_r = env_float("AI_ZONE_DO_NOT_CHASE_AFTER_R", 1.0)
+    if max_moved_r > 0 and moved_r_from_ob > max_moved_r:
+        return None, f"ai_zone_do_not_chase_moved_{moved_r_from_ob:.2f}R_gt_{max_moved_r:.2f}R"
+
+    rr = env_float("AI_ZONE_PREFERRED_RR", settings.rr)
+    min_rr = env_float("AI_ZONE_MIN_RR", 2.0)
+    if rr < min_rr:
+        rr = min_rr
+
+    if direction == "buy":
+        tp = market_entry + risk * rr
+        entry_status = "BUY_MARKET_AI_ZONE"
+    else:
+        tp = market_entry - risk * rr
+        entry_status = "SELL_MARKET_AI_ZONE"
+
+    h1_context_ob = selected_ob.get("h1_context_ob")
+    return {
+        "decision": decision,
+        "trade_mode": trade_mode,
+        "direction": direction,
+        "ob_timeframe": selected_ob.get("timeframe"),
+        "ob_type": selected_ob.get("type"),
+        "selected_ob_high": float(selected_ob["high"]),
+        "selected_ob_low": float(selected_ob["low"]),
+        "selected_ob_time": selected_ob.get("time"),
+        "stop_source": stop_source,
+        "inside_h1_ob": bool(selected_ob.get("inside_h1_ob") or h1_context_ob),
+        "h1_context_ob_high": float(h1_context_ob.get("high", 0.0)) if h1_context_ob else 0.0,
+        "h1_context_ob_low": float(h1_context_ob.get("low", 0.0)) if h1_context_ob else 0.0,
+        "entry": float(market_entry),
+        "stop_loss": float(stop),
+        "take_profit": float(tp),
+        "rr": float(rr),
+        "risk_percent": env_float("AI_ZONE_ENTRY_RISK_PERCENT", 0.5),
+        "execution_style": "market",
+        "entry_model": os.getenv("AI_ZONE_MODEL_NAME", "OB_NOT_MITIGATED_ZONE_ENTRY"),
+        "original_ob_mitigated": False,
+        "missed_limit_entry": float(limit_entry),
+        "distance_from_ob_pips": float(distance_from_ob_pips),
+        "moved_r_from_ob": float(moved_r_from_ob),
+        "entry_status": entry_status,
+    }, None
+
+
+def build_trade_candidate(
+    decision: str,
+    trade_mode: str,
+    selected_ob: dict,
+    current_close: float,
+    settings: BacktestSettings,
+    now: pd.Timestamp | None = None,
+):
     if decision not in VALID_DECISIONS or not selected_ob:
         return None, "no_valid_decision_or_ob"
     direction = "buy" if decision.startswith("BUY") else "sell"
     ob_high = float(selected_ob["high"])
     ob_low = float(selected_ob["low"])
     buffer_price = settings.ob_buffer_pips * PIP_SIZE
+    h1_context_ob = selected_ob.get("h1_context_ob")
+
     if direction == "buy":
         entry = ob_high
-        stop = ob_low - buffer_price
+        normal_stop = ob_low - buffer_price
+        stop, stop_source = apply_h1_context_stop_backtest(decision, direction, selected_ob, entry, normal_stop, buffer_price)
         risk = entry - stop
         tp = entry + risk * settings.rr
         if entry >= current_close:
-            return None, "buy_limit_not_below_current_price"
+            return build_ai_zone_market_candidate(
+                decision, trade_mode, selected_ob, current_close, direction, entry, normal_stop, buffer_price, settings, now
+            )
     else:
         entry = ob_low
-        stop = ob_high + buffer_price
+        normal_stop = ob_high + buffer_price
+        stop, stop_source = apply_h1_context_stop_backtest(decision, direction, selected_ob, entry, normal_stop, buffer_price)
         risk = stop - entry
         tp = entry - risk * settings.rr
         if entry <= current_close:
-            return None, "sell_limit_not_above_current_price"
+            return build_ai_zone_market_candidate(
+                decision, trade_mode, selected_ob, current_close, direction, entry, normal_stop, buffer_price, settings, now
+            )
+
     if risk <= 0:
         return None, "invalid_risk_distance"
     return {
@@ -282,12 +457,22 @@ def build_trade_candidate(decision: str, trade_mode: str, selected_ob: dict, cur
         "selected_ob_high": ob_high,
         "selected_ob_low": ob_low,
         "selected_ob_time": selected_ob.get("time"),
+        "stop_source": stop_source,
+        "inside_h1_ob": bool(selected_ob.get("inside_h1_ob") or h1_context_ob),
+        "h1_context_ob_high": float(h1_context_ob.get("high", 0.0)) if h1_context_ob else 0.0,
+        "h1_context_ob_low": float(h1_context_ob.get("low", 0.0)) if h1_context_ob else 0.0,
         "entry": float(entry),
         "stop_loss": float(stop),
         "take_profit": float(tp),
         "rr": float(settings.rr),
+        "risk_percent": float(settings.risk_percent),
+        "execution_style": "pending_limit",
+        "entry_model": "OB_MITIGATION_LIMIT_ENTRY",
+        "original_ob_mitigated": None,
+        "missed_limit_entry": None,
+        "distance_from_ob_pips": None,
+        "moved_r_from_ob": None,
     }, None
-
 
 def classify_candle_exit(direction: str, low: float, high: float, sl: float, tp: float) -> str | None:
     if direction == "buy":
@@ -352,6 +537,15 @@ def main() -> None:
     parser.add_argument("--ob-buffer-pips", type=float, default=env_float("OB_BUFFER_PIPS", 3.0))
     parser.add_argument("--save-skipped", action="store_true")
     parser.add_argument("--use-ticks", type=str, default="true")
+    parser.add_argument(
+        "--structure-lookback",
+        type=int,
+        default=env_int("BACKTEST_STRUCTURE_LOOKBACK", 2000),
+        help="Max bars per timeframe passed to structure detection. Use 0 for full-history (slow).",
+    )
+    parser.add_argument("--m5-lookback", type=int, default=0, help="Override M5 structure lookback.")
+    parser.add_argument("--m15-lookback", type=int, default=0, help="Override M15 structure lookback.")
+    parser.add_argument("--h1-lookback", type=int, default=0, help="Override H1 structure lookback.")
     args = parser.parse_args()
 
     env_initial = os.getenv("BACKTEST_INITIAL_BALANCE", "").strip()
@@ -381,7 +575,7 @@ def main() -> None:
 
     ticks = pd.DataFrame(columns=["time", "bid", "ask"])
     ticks_enabled = False
-    if args.ticks_csv and Path(args.ticks_csv).exists():
+    if settings.use_ticks and args.ticks_csv and Path(args.ticks_csv).exists():
         try:
             ticks_df = read_csv_smart(args.ticks_csv, expected_kind="ticks")
             ticks_map = map_columns(ticks_df, is_ticks=True)
@@ -410,6 +604,24 @@ def main() -> None:
         f"Bars loaded: raw={len(bars)}, M5={len(m5)}, M15={len(m15)}, H1={len(h1)} | "
         f"time range {bars['time'].min()} -> {bars['time'].max()}"
     )
+    if settings.use_ticks and args.ticks_csv and not ticks_enabled:
+        print("Ticks were requested, but no valid ticks dataset was loaded. Falling back to candle-only exits.")
+    if not settings.use_ticks:
+        print("Tick replay disabled (--use-ticks false): skipping tick CSV load and using candle-based exits.")
+
+    structure_lookback = max(0, int(args.structure_lookback))
+    if structure_lookback and structure_lookback < 300:
+        structure_lookback = 300
+
+    lookback_m5 = max(0, int(args.m5_lookback or structure_lookback))
+    lookback_m15 = max(0, int(args.m15_lookback or structure_lookback))
+    lookback_h1 = max(0, int(args.h1_lookback or structure_lookback))
+    if lookback_m5 and lookback_m5 < 300:
+        lookback_m5 = 300
+    if lookback_m15 and lookback_m15 < 300:
+        lookback_m15 = 300
+    if lookback_h1 and lookback_h1 < 300:
+        lookback_h1 = 300
 
     swing_length = int(os.getenv("SMC_SWING_LENGTH", "20"))
     internal_length = int(os.getenv("SMC_INTERNAL_LENGTH", "3"))
@@ -425,14 +637,38 @@ def main() -> None:
     consec_wins = consec_losses = 0
     max_consec_wins = max_consec_losses = 0
     active: dict[str, Any] | None = None
+    h1_end = 0
+    m15_end = 0
+    h1_result_cache: dict[str, Any] = {"events": []}
+    m15_result_cache: dict[str, Any] = {"events": []}
+    h1_cache_time = None
+    m15_cache_time = None
 
     for i in range(len(m5)):
         now = pd.Timestamp(m5.iloc[i]["time"])
         if i and i % 5000 == 0:
             print(f"Replay progress: {i}/{len(m5)} M5 candles processed...")
-        h1_now = h1[h1["time"] <= now].reset_index(drop=True)
-        m15_now = m15[m15["time"] <= now].reset_index(drop=True)
-        m5_now = m5[m5["time"] <= now].reset_index(drop=True)
+        while h1_end < len(h1) and pd.Timestamp(h1.iloc[h1_end]["time"]) <= now:
+            h1_end += 1
+        while m15_end < len(m15) and pd.Timestamp(m15.iloc[m15_end]["time"]) <= now:
+            m15_end += 1
+
+        if lookback_h1 > 0:
+            h1_start = max(0, h1_end - lookback_h1)
+        else:
+            h1_start = 0
+        if lookback_m15 > 0:
+            m15_start = max(0, m15_end - lookback_m15)
+        else:
+            m15_start = 0
+        if lookback_m5 > 0:
+            m5_start = max(0, (i + 1) - lookback_m5)
+        else:
+            m5_start = 0
+
+        h1_now = h1.iloc[h1_start:h1_end].reset_index(drop=True)
+        m15_now = m15.iloc[m15_start:m15_end].reset_index(drop=True)
+        m5_now = m5.iloc[m5_start : (i + 1)].reset_index(drop=True)
         if len(h1_now) < 200 or len(m15_now) < 300 or len(m5_now) < 300:
             equity_curve.append({"time": now, "balance": balance})
             continue
@@ -463,27 +699,14 @@ def main() -> None:
                         active["state"] = "open"
                         active["fill_time"] = now
             if active and active["state"] == "open":
-                # Track intra-trade extremes in R multiples (MFE/MAE) using the current M5 candle range.
-                risk_price = float(active.get("risk_price") or abs(active["entry"] - active["stop_loss"]))
-                entry_price = float(active["entry"])
-                if risk_price > 0:
-                    if active["direction"] == "buy":
-                        r_fav = (c_high - entry_price) / risk_price
-                        r_adv = (c_low - entry_price) / risk_price
-                    else:
-                        # For sells, favorable move is price moving down.
-                        r_fav = (entry_price - c_low) / risk_price
-                        r_adv = (entry_price - c_high) / risk_price
-                    active["max_favorable_r"] = max(float(active.get("max_favorable_r", 0.0)), float(r_fav))
-                    active["max_adverse_r"] = min(float(active.get("max_adverse_r", 0.0)), float(r_adv))
-
                 exit_hit = classify_tick_exit(active["direction"], tick_slice, active["stop_loss"], active["take_profit"])
                 if exit_hit is None:
                     exit_hit = classify_candle_exit(
                         active["direction"], c_low, c_high, active["stop_loss"], active["take_profit"]
                     )
                 if exit_hit:
-                    risk_amount = balance * (settings.risk_percent / 100.0)
+                    active_risk_percent = float(active.get("risk_percent", settings.risk_percent) or settings.risk_percent)
+                    risk_amount = balance * (active_risk_percent / 100.0)
                     risk_price = abs(active["entry"] - active["stop_loss"])
                     cost_price = (settings.spread_points + settings.slippage_points) * POINT_SIZE
                     r_cost = (cost_price / risk_price) if risk_price > 0 else 0.0
@@ -513,8 +736,15 @@ def main() -> None:
                     active = None
 
         if not active:
-            h1_result = detect_structure(h1_now, swing_length) or {"events": []}
-            m15_result = detect_structure(m15_now, internal_length)
+            if h1_cache_time != h1_now.iloc[-1]["time"]:
+                h1_result_cache = detect_structure(h1_now, swing_length) or {"events": []}
+                h1_cache_time = h1_now.iloc[-1]["time"]
+            if m15_cache_time != m15_now.iloc[-1]["time"]:
+                m15_result_cache = detect_structure(m15_now, internal_length)
+                m15_cache_time = m15_now.iloc[-1]["time"]
+
+            h1_result = h1_result_cache
+            m15_result = m15_result_cache
             m5_result = detect_structure(m5_now, internal_length)
             h1_last_event = h1_result["events"][-1] if h1_result["events"] else None
             external_bias = h1_last_event["bias"] if h1_last_event else (BULLISH if c_close >= h1_now.iloc[-1]["close"] else BEARISH)
@@ -528,32 +758,49 @@ def main() -> None:
             decision, trade_bias, trade_mode = decide_trade_context(
                 external_bias, current_location, internal_event_pack, swing_low, swing_high
             )
+            h1_supply_ob = (
+                find_rejection_order_block(h1_now, h1_result, BEARISH, "H1")
+                or last_valid_ob(h1_result["events"], h1_now, BEARISH, "H1")
+            )
+            h1_demand_ob = (
+                find_rejection_order_block(h1_now, h1_result, BULLISH, "H1")
+                or last_valid_ob(h1_result["events"], h1_now, BULLISH, "H1")
+            )
             selected_ob, _, _, _ = select_active_ob(
-                trade_bias, trade_mode, m15_result, m5_result, m15_now, m5_now, swing_low, swing_high, equilibrium, fibs
+                trade_bias,
+                trade_mode,
+                m15_result,
+                m5_result,
+                m15_now,
+                m5_now,
+                swing_low,
+                swing_high,
+                equilibrium,
+                fibs,
+                h1_supply_ob=h1_supply_ob,
+                h1_demand_ob=h1_demand_ob,
+                current_price=c_close,
             )
             if selected_ob and is_ob_invalidated(m5_now, selected_ob, use_close=True):
                 selected_ob = last_valid_ob(
                     m5_result["events"], m5_now, trade_bias if trade_bias else external_bias, "M5"
                 ) or most_recent_ob(selected_ob)
-            candidate, reason = build_trade_candidate(decision, trade_mode, selected_ob, c_close, settings)
+            candidate, reason = build_trade_candidate(decision, trade_mode, selected_ob, c_close, settings, now)
             if candidate:
                 total_signals += 1
-                entry_status = get_entry_status(c_close, candidate["entry"], trade_bias, POINT_SIZE)
+                entry_status = candidate.get("entry_status") or get_entry_status(c_close, candidate["entry"], trade_bias, POINT_SIZE)
+                execution_style = candidate.get("execution_style", "pending_limit")
                 active = {
                     "trade_id": f"T{len(trades)+1:06d}",
                     "signal_time": now,
-                    "fill_time": None,
+                    "fill_time": now if execution_style == "market" else None,
                     "close_time": None,
-                    "state": "pending",
+                    "state": "open" if execution_style == "market" else "pending",
                     "expiry_time": now + timedelta(hours=settings.order_expiry_hours),
                     "entry_status": entry_status,
                     "result": "",
                     "profit": 0.0,
                     "r_multiple": 0.0,
-                    # MFE/MAE tracking (R multiples) + risk calibration for those calculations.
-                    "max_favorable_r": 0.0,
-                    "max_adverse_r": 0.0,
-                    "risk_price": abs(float(candidate["entry"]) - float(candidate["stop_loss"])),
                     "balance_after": balance,
                     "max_drawdown_at_trade": max_drawdown,
                     "h1_bias": "bullish" if external_bias == BULLISH else "bearish",
@@ -598,170 +845,16 @@ def main() -> None:
         equity_curve.append({"time": now, "balance": balance})
 
     closed_trades = [t for t in trades if t.get("result") in {"WIN", "LOSS"}]
+    trades_by_entry_model = Counter(t.get("entry_model", "UNKNOWN") for t in closed_trades)
+    trades_by_execution_style = Counter(t.get("execution_style", "UNKNOWN") for t in closed_trades)
     gross_profit = sum(t["profit"] for t in closed_trades if t["profit"] > 0)
     gross_loss = abs(sum(t["profit"] for t in closed_trades if t["profit"] < 0))
     profit_factor = (gross_profit / gross_loss) if gross_loss > 0 else 0.0
     avg_r = sum(t["r_multiple"] for t in closed_trades) / len(closed_trades) if closed_trades else 0.0
     best_r = max((t["r_multiple"] for t in closed_trades), default=0.0)
     worst_r = min((t["r_multiple"] for t in closed_trades), default=0.0)
-    avg_mfe_r = (
-        sum(float(t.get("max_favorable_r", 0.0)) for t in closed_trades) / len(closed_trades) if closed_trades else 0.0
-    )
-    avg_mae_r = (
-        sum(float(t.get("max_adverse_r", 0.0)) for t in closed_trades) / len(closed_trades) if closed_trades else 0.0
-    )
     max_dd_pct = (max_drawdown / peak_balance * 100.0) if peak_balance > 0 else 0.0
     win_rate = (wins / (wins + losses) * 100.0) if (wins + losses) > 0 else 0.0
-
-    def infer_symbol_from_csv_path(path_str: str) -> str:
-        # Typical MT5 file names: GBPUSD_mt5_bars.csv → GBPUSD
-        stem = Path(path_str).stem
-        return stem.split("_")[0] if "_" in stem else stem
-
-    def make_group_key(decision: str, trade_mode: str, ob_timeframe: str) -> str:
-        return f"decision={decision}|trade_mode={trade_mode}|ob_timeframe={ob_timeframe}"
-
-    def group_trades_by_key(trade_rows: list[dict[str, Any]]):
-        grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
-        for tr in trade_rows:
-            key = make_group_key(
-                str(tr.get("decision") or ""),
-                str(tr.get("trade_mode") or ""),
-                str(tr.get("ob_timeframe") or ""),
-            )
-            grouped[key].append(tr)
-        return grouped
-
-    def best_and_worst_by_avg_r(trade_rows: list[dict[str, Any]], key_field: str) -> tuple[str, str]:
-        avgs: dict[str, float] = {}
-        for tr in trade_rows:
-            k = str(tr.get(key_field) or "")
-            avgs.setdefault(k, 0.0)
-        # accumulate sums and counts
-        sums: dict[str, float] = {}
-        counts: dict[str, int] = {}
-        for tr in trade_rows:
-            k = str(tr.get(key_field) or "")
-            sums[k] = sums.get(k, 0.0) + float(tr.get("r_multiple", 0.0))
-            counts[k] = counts.get(k, 0) + 1
-        for k, s in sums.items():
-            if counts.get(k, 0) > 0:
-                avgs[k] = s / counts[k]
-        # prefer non-empty keys
-        candidates = [(k, v) for k, v in avgs.items() if k != ""]
-        if not candidates:
-            return "N/A", "N/A"
-        best_key = max(candidates, key=lambda x: x[1])[0]
-        worst_key = min(candidates, key=lambda x: x[1])[0]
-        return best_key, worst_key
-
-    best_decision_type, worst_decision_type = best_and_worst_by_avg_r(closed_trades, "decision")
-    best_ob_timeframe, worst_ob_timeframe = best_and_worst_by_avg_r(closed_trades, "ob_timeframe")
-
-    # Build an "expected by group" map so forward-testing comparisons can match by:
-    # decision + trade_mode + OB timeframe (without changing any parameters).
-    expected_by_group: dict[str, Any] = {}
-    for group_key, group_rows in group_trades_by_key(closed_trades).items():
-        g_wins = sum(1 for r in group_rows if r.get("result") == "WIN")
-        g_losses = sum(1 for r in group_rows if r.get("result") == "LOSS")
-        g_total = len(group_rows)
-        g_win_rate = (g_wins / g_total * 100.0) if g_total > 0 else 0.0
-        g_gross_profit = sum(float(r["profit"]) for r in group_rows if float(r.get("profit", 0.0)) > 0)
-        g_gross_loss = abs(sum(float(r["profit"]) for r in group_rows if float(r.get("profit", 0.0)) < 0))
-        g_profit_factor = (g_gross_profit / g_gross_loss) if g_gross_loss > 0 else 0.0
-        g_avg_r = (
-            sum(float(r.get("r_multiple", 0.0)) for r in group_rows) / g_total if g_total > 0 else 0.0
-        )
-        g_avg_mfe_r = (
-            sum(float(r.get("max_favorable_r", 0.0)) for r in group_rows) / g_total if g_total > 0 else 0.0
-        )
-        g_avg_mae_r = (
-            sum(float(r.get("max_adverse_r", 0.0)) for r in group_rows) / g_total if g_total > 0 else 0.0
-        )
-        expected_by_group[group_key] = {
-            "total_trades": int(g_total),
-            "win_rate": round(g_win_rate, 2),
-            "profit_factor": round(g_profit_factor, 4),
-            "average_r": round(g_avg_r, 4),
-            "average_mfe_r": round(g_avg_mfe_r, 4),
-            "average_mae_r": round(g_avg_mae_r, 4),
-            "wins": int(g_wins),
-            "losses": int(g_losses),
-        }
-
-    # Write "latest backtest knowledge" for forward comparison.
-    backend_repo_root = backend_dir.parent
-    knowledge_dir = backend_repo_root / "storage" / "knowledge"
-    knowledge_dir.mkdir(parents=True, exist_ok=True)
-    strategy_version = (os.getenv("STRATEGY_VERSION", "v1_active") or "v1_active").strip()
-    symbol = infer_symbol_from_csv_path(args.bars_csv)
-
-    recommendation = (
-        f"Forward demo: prioritize {best_decision_type} setups with OB timeframe {best_ob_timeframe}. "
-        f"Use the pending/OB lock safety defaults and be cautious with {worst_decision_type} / {worst_ob_timeframe} "
-        f"until forward evidence improves."
-        if best_decision_type != "N/A"
-        else "Forward demo: run a conservative sample first, then narrow focus based on forward outcome matching."
-    )
-
-    backtest_date_range = {"start": str(bars["time"].min()), "end": str(bars["time"].max())}
-    knowledge_latest = {
-        "strategy_version": strategy_version,
-        "symbol": symbol,
-        "backtest_date_range": backtest_date_range,
-        "total_trades": int(wins + losses),
-        "win_rate": round(win_rate, 2),
-        "profit_factor": round(profit_factor, 4),
-        "max_drawdown": round(max_drawdown, 2),
-        "final_balance": round(balance, 2),
-        "best_decision_type": best_decision_type,
-        "worst_decision_type": worst_decision_type,
-        "best_ob_timeframe": best_ob_timeframe,
-        "worst_ob_timeframe": worst_ob_timeframe,
-        "average_mfe_r": round(avg_mfe_r, 4),
-        "average_mae_r": round(avg_mae_r, 4),
-        "recommendation_for_forward_demo_testing": recommendation,
-        "expected_by_group": expected_by_group,
-        "generated_at": pd.Timestamp.now().isoformat(),
-        "inputs": {
-            "bars_csv": str(args.bars_csv),
-            "ticks_csv": str(args.ticks_csv) if args.ticks_csv else "",
-            "rr": settings.rr,
-            "ob_buffer_pips": settings.ob_buffer_pips,
-            "use_ticks": bool(settings.use_ticks),
-        },
-    }
-
-    knowledge_json_path = knowledge_dir / "backtest_knowledge_latest.json"
-    knowledge_txt_path = knowledge_dir / "backtest_knowledge_latest.txt"
-    knowledge_json_path.write_text(json.dumps(knowledge_latest, default=str, indent=2), encoding="utf-8")
-
-    knowledge_txt_lines = [
-        "BACKTEST KNOWLEDGE (LATEST)",
-        "",
-        f"Strategy version: {strategy_version}",
-        f"Symbol: {symbol}",
-        f"Backtest date range: {backtest_date_range['start']} -> {backtest_date_range['end']}",
-        f"Total trades: {wins + losses}",
-        f"Win rate: {round(win_rate, 2)}%",
-        f"Profit factor: {round(profit_factor, 4)}",
-        f"Max drawdown: {round(max_drawdown, 2)}",
-        f"Final balance: {round(balance, 2)}",
-        "",
-        f"Best decision type: {best_decision_type}",
-        f"Worst decision type: {worst_decision_type}",
-        f"Best OB timeframe: {best_ob_timeframe}",
-        f"Worst OB timeframe: {worst_ob_timeframe}",
-        "",
-        f"Average MFE R: {round(avg_mfe_r, 4)}",
-        f"Average MAE R: {round(avg_mae_r, 4)}",
-        "",
-        "Recommendation for forward demo testing:",
-        f"{recommendation}",
-        "",
-        f"Generated at: {knowledge_latest['generated_at']}",
-    ]
-    knowledge_txt_path.write_text("\n".join(knowledge_txt_lines) + "\n", encoding="utf-8")
 
     out_dir = backend_dir / "storage" / "backtests"
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -795,6 +888,8 @@ def main() -> None:
         "trades_by_decision": dict(trades_by_decision),
         "trades_by_trade_mode": dict(trades_by_mode),
         "trades_by_ob_timeframe": dict(trades_by_ob_tf),
+        "trades_by_entry_model": dict(trades_by_entry_model),
+        "trades_by_execution_style": dict(trades_by_execution_style),
         "monthly_performance": monthly_performance(trades),
         "ticks_used": bool(ticks_enabled),
         "settings": settings.__dict__,
@@ -832,6 +927,8 @@ def main() -> None:
     print(f"trades_by_decision: {summary['trades_by_decision']}")
     print(f"trades_by_trade_mode: {summary['trades_by_trade_mode']}")
     print(f"trades_by_ob_timeframe: {summary['trades_by_ob_timeframe']}")
+    print(f"trades_by_entry_model: {summary['trades_by_entry_model']}")
+    print(f"trades_by_execution_style: {summary['trades_by_execution_style']}")
     print(f"monthly_performance: {summary['monthly_performance']}")
     print(f"Saved trades CSV: {trades_path}")
     print(f"Saved summary JSON: {summary_path}")
